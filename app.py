@@ -1,0 +1,1204 @@
+"""
+SAO Demo App
+"""
+import uuid
+from typing import Optional
+import streamlit as st
+import os
+import io
+
+# Load environment from secrets before importing domain/agent modules.
+from dotenv import load_dotenv
+from setup_env import setup_environment
+
+# Load environment variables
+load_dotenv()
+
+# Set up environment from secrets.toml
+if not os.getenv('_SAO_ENV_LOADED'):
+    setup_environment()
+    os.environ['_SAO_ENV_LOADED'] = 'true'
+
+from agent_factory import AgentFactory
+from domain_manager import DomainManager
+from langchain_core.messages import AIMessage, HumanMessage
+from agent_frameworks.langgraph.langgraph_rag import get_domain_rag_system
+from helpers.sao_api_helpers import (
+    create_sao_logger,
+    get_sao_app_url,
+    get_sao_project_id,
+    get_sao_agent_stream_id,
+)
+from helpers.agent_control_helpers import init_agent_control
+from helpers.hallucination_helpers import log_hallucination_for_domain
+from experiments.experiment_helpers import (
+    get_all_datasets,
+    get_dataset_by_name,
+    get_dataset_by_id,
+    create_domain_dataset,
+    read_dataset_csv,
+    run_domain_experiment,
+    get_domain_dataset_name,
+    AVAILABLE_METRICS
+)
+
+# Configuration
+FRAMEWORK = "LangGraph"
+
+
+def _models_for_provider(domain_info: dict, provider: str) -> tuple[list[str], str]:
+    """Return model options and default for the selected provider."""
+    if provider == "hosted":
+        models = domain_info.get("hosted_models") or ["gpt-4o"]
+        default = domain_info.get("hosted_default_model") or models[0]
+    elif provider == "bedrock":
+        models = domain_info.get("bedrock_models") or ["mistral.ministral-3-14b-instruct", "mistral.ministral-3-8b-instruct"]
+        default = domain_info.get("bedrock_default_model") or models[0]
+    else:
+        models = domain_info.get("local_models") or domain_info.get("available_models") or ["gemma4"]
+        default = (
+            domain_info.get("local_default_model")
+            or domain_info.get("default_model")
+            or models[0]
+        )
+    return models, default
+
+
+def _invalidate_domain_agent_state(domain_name: str) -> None:
+    """Clear cached agent and RAG instances after provider/model changes."""
+    prefix = f"agent_{domain_name}_"
+    for key in list(st.session_state.keys()):
+        if isinstance(key, str) and key.startswith(prefix):
+            del st.session_state[key]
+    rag_key = f"rag_initialized_{domain_name}"
+    if rag_key in st.session_state:
+        del st.session_state[rag_key]
+    for key in list(st.session_state.keys()):
+        if isinstance(key, str) and key.startswith(f"rag_initialized_{domain_name}_"):
+            del st.session_state[key]
+    try:
+        from agent_frameworks.langgraph.langgraph_rag import _rag_cache
+
+        stale_keys = [key for key in _rag_cache if key.startswith(f"{domain_name}_")]
+        for key in stale_keys:
+            del _rag_cache[key]
+    except Exception:
+        pass
+
+
+def _normalize_provider(provider: Optional[str]) -> str:
+    """Normalize provider values to 'local', 'hosted', or 'bedrock'."""
+    normalized = str(provider or "local").strip().lower()
+    if normalized in {"hosted", "openai"}:
+        return "hosted"
+    if normalized in {"bedrock", "aws"}:
+        return "bedrock"
+    return "local"
+
+
+def render_model_settings(domain_name: str, domain_config_key: str) -> tuple[str, str]:
+    """Render provider/model controls in the sidebar and return the active selection."""
+    st.subheader("Model")
+    domain_info = st.session_state.get(domain_config_key, {})
+
+    provider_key = f"llm_provider_{domain_name}"
+    prev_provider_key = f"llm_provider_prev_{domain_name}"
+    selected_model_key = f"selected_model_{domain_name}"
+
+    # Only providers whose credential is set in secrets.toml are offered, and
+    # the default selection follows priority local > bedrock > hosted.
+    from helpers.llm_utils import configured_providers, default_provider
+
+    provider_options = configured_providers()
+    if not provider_options:
+        st.error(
+            "No LLM provider is configured. Set `ollama_base_url`, `openai_api_key`, "
+            "or `bedrock_api_key` in `.streamlit/secrets.toml`."
+        )
+        st.stop()
+
+    # Initialize / repair the stored provider so it's always a configured one.
+    if (
+        provider_key not in st.session_state
+        or _normalize_provider(st.session_state[provider_key]) not in provider_options
+    ):
+        st.session_state[provider_key] = default_provider()
+    if prev_provider_key not in st.session_state:
+        st.session_state[prev_provider_key] = st.session_state[provider_key]
+
+    prev_provider = st.session_state[prev_provider_key]
+    provider_labels = {
+        "local": "Local (Ollama)",
+        "hosted": "Hosted (OpenAI)",
+        "bedrock": "Bedrock (AWS)",
+    }
+    # The current selection is driven by st.session_state[provider_key] (seeded
+    # above), so we don't pass index — Streamlit uses the session value.
+    selected_provider = st.radio(
+        "Model provider",
+        options=provider_options,
+        format_func=lambda x: provider_labels.get(x, x),
+        key=provider_key,
+        horizontal=True,
+    )
+    selected_provider = _normalize_provider(selected_provider)
+
+    try:
+        from helpers.pgvector_utils import collection_exists
+
+        # The app can query whichever provider's index exists, so only warn
+        # when none has been built. setup_vectordb builds one index per
+        # configured provider automatically.
+        has_any_index = (
+            collection_exists(domain_name, "local")
+            or collection_exists(domain_name, "hosted")
+            or collection_exists(domain_name, "bedrock")
+        )
+        if not has_any_index:
+            st.warning(
+                f"No vector index for **{domain_name}**. Run: "
+                f"`python helpers/setup_vectordb.py {domain_name}`"
+            )
+    except Exception:
+        pass
+
+    available_models, default_model = _models_for_provider(domain_info, selected_provider)
+
+    if selected_provider != _normalize_provider(prev_provider):
+        st.session_state[selected_model_key] = default_model
+        st.session_state[prev_provider_key] = selected_provider
+        _invalidate_domain_agent_state(domain_name)
+        st.rerun()
+
+    if (
+        selected_model_key not in st.session_state
+        or st.session_state[selected_model_key] not in available_models
+    ):
+        st.session_state[selected_model_key] = default_model
+
+    prev_model = st.session_state[selected_model_key]
+    model_index = available_models.index(prev_model) if prev_model in available_models else 0
+    selected_model = st.selectbox(
+        "Select Model",
+        options=available_models,
+        index=model_index,
+        key=f"model_select_{domain_name}",
+        help={
+            "local": "Ollama model used for chat and experiments",
+            "hosted": "OpenAI model used for chat and experiments",
+            "bedrock": "AWS Bedrock model used for chat and experiments",
+        }.get(selected_provider, "Model used for chat and experiments"),
+    )
+    if selected_model != prev_model:
+        st.session_state[selected_model_key] = selected_model
+        _invalidate_domain_agent_state(domain_name)
+        st.rerun()
+
+    st.session_state[prev_provider_key] = selected_provider
+    return selected_provider, selected_model
+
+
+def initialize_rag_systems(domain_name: str, llm_provider: str = "local"):
+    """Initialize RAG systems for the selected provider."""
+    from helpers.llm_utils import reset_llm_provider, set_llm_provider
+
+    provider = _normalize_provider(llm_provider)
+    token = set_llm_provider(provider)
+    try:
+        print(f"🔧 Initializing RAG system for domain: {domain_name} ({provider})")
+        get_domain_rag_system(domain_name)
+        print("✅ RAG system initialized successfully")
+        return True
+    except Exception as e:
+        print(f"❌ Failed to initialize RAG system: {e}")
+        return False
+    finally:
+        reset_llm_provider(token)
+
+
+def escape_dollar_signs(text) -> str:
+    """Escape dollar signs in text to prevent LaTeX interpretation.
+
+    Accepts either a plain string or LangChain message content (which is a list
+    of blocks for ChatBedrockConverse), normalizing to text first so Bedrock
+    responses render without erroring.
+    """
+    from helpers.llm_utils import message_content_to_text
+
+    return message_content_to_text(text).replace('$', '\\$')
+
+
+def add_hallucination_interaction_to_chat(domain_config: dict) -> bool:
+    """Append the demo hallucination Q&A to chat history for UI display."""
+    example_queries = domain_config.get("ui", {}).get("example_queries", [])
+    hallucinations = domain_config.get("demo_hallucinations", [])
+
+    if not example_queries or not hallucinations:
+        return False
+
+    question = example_queries[0]
+    hallucinated_answer = hallucinations[0].get("hallucinated_answer", "")
+
+    if not question or not hallucinated_answer:
+        return False
+
+    if "messages" not in st.session_state:
+        st.session_state.messages = []
+
+    st.session_state.messages.append({"message": HumanMessage(content=question), "agent": "user"})
+    st.session_state.messages.append({"message": AIMessage(content=hallucinated_answer), "agent": "assistant"})
+    return True
+
+
+def display_chat_history():
+    """Display all messages in the chat history with agent attribution."""
+    if not st.session_state.messages:
+        return
+
+    for message_data in st.session_state.messages:
+        if isinstance(message_data, dict):
+            message = message_data.get("message")
+
+            if isinstance(message, HumanMessage):
+                with st.chat_message("user"):
+                    st.write(escape_dollar_signs(message.content))
+            elif isinstance(message, AIMessage):
+                with st.chat_message("assistant"):
+                    st.write(escape_dollar_signs(message.content))
+        else:
+            # Fallback for old message format
+            if isinstance(message_data, HumanMessage):
+                with st.chat_message("user"):
+                    st.write(escape_dollar_signs(message_data.content))
+            elif isinstance(message_data, AIMessage):
+                with st.chat_message("assistant"):
+                    st.write(escape_dollar_signs(message_data.content))
+    
+    # Show loading indicator if currently processing
+    if st.session_state.get("processing", False):
+        with st.chat_message("assistant"):
+            st.write("Thinking...")
+
+
+def show_example_queries(query_1: str, query_2: str):
+    """Show example queries demonstrating the finance system"""
+    st.subheader("💡 Try these examples")
+
+    # Use a container with custom CSS to reduce spacing
+    with st.container():
+        col1, col2 = st.columns([0.48, 0.48])
+
+        with col1:
+            if st.button(query_1, key="query_1", use_container_width=True):
+                return query_1
+
+        with col2:
+            if st.button(query_2, key="query_2", use_container_width=True):
+                return query_2
+    return None
+
+
+def orchestrate_streamlit_and_get_user_input(
+    agent_title: str, example_query_1: str, example_query_2: str, domain_name: str
+):
+    """Set up the Streamlit interface and get user input"""
+    # App title and description
+    st.title(agent_title)
+    
+    # Initialize session state
+    if "messages" not in st.session_state:
+        st.session_state.messages = []
+    # Create state variable but don't start SAO session until we have user input
+    if "sao_session_started" not in st.session_state:
+        st.session_state.sao_session_started = False
+    # Store domain name in session state
+    if "domain_name" not in st.session_state:
+        st.session_state.domain_name = domain_name
+
+    # Show example queries
+    example_query = show_example_queries(example_query_1, example_query_2)
+
+    # Display chat history
+    display_chat_history()
+
+    # Get user input
+    user_input = st.chat_input("How can I help you?...")
+    # Use example query if button was clicked
+    if example_query:
+        user_input = example_query
+    return user_input
+
+
+def process_input_for_simple_app(user_input: str | None):
+    """Process user input and generate response - using AgentFactory directly"""
+    if user_input:
+        # Start SAO session on first user input.
+        # Uses the per-session SplunkAOLogger (set in render_chat_page) so each browser
+        # tab has its own isolated SAO session rather than sharing a global context.
+        if not st.session_state.sao_session_started:
+            try:
+                domain_name = st.session_state.get("domain_name", "default")
+                session_name = f"{domain_name.title()} Agent Demo"
+                per_session_logger = st.session_state.get("sao_logger")
+                if per_session_logger:
+                    per_session_logger.start_session(name=session_name, external_id=st.session_state.session_id)
+                st.session_state.sao_session_started = True
+            except Exception as e:
+                st.error(f"Failed to start SAO session: {str(e)}")
+                st.stop()
+        
+        # Add user message to chat history
+        user_message = HumanMessage(content=user_input)
+        st.session_state.messages.append({"message": user_message, "agent": "user"})
+
+        # Set processing flag and rerun to show the loading state
+        st.session_state.processing = True
+        st.rerun()
+    
+    # Check if we need to process a message
+    if st.session_state.get("processing", False):
+        # Convert session state messages to the format expected by the agent
+        conversation_messages = []
+        for msg_data in st.session_state.messages:
+            if isinstance(msg_data, dict) and "message" in msg_data:
+                message = msg_data["message"]
+                if isinstance(message, HumanMessage):
+                    conversation_messages.append({"role": "user", "content": message.content})
+                elif isinstance(message, AIMessage):
+                    conversation_messages.append({"role": "assistant", "content": message.content})
+        
+        # Get the actual response from the agent (Agent Control is handled via @control decorators)
+        response = st.session_state.agent.process_query(conversation_messages)
+
+        # Create AI message and add to history
+        ai_message = AIMessage(content=response)
+        st.session_state.messages.append(
+            {"message": ai_message, "agent": "assistant"}
+        )
+        
+        # Clear processing flag and rerun to show the response
+        st.session_state.processing = False
+        st.rerun()
+
+
+def render_experiments_page(domain_name: str, domain_config, agent_factory):
+    """Render the experiments page UI.
+    
+    Args:
+        domain_name: Name of the domain
+        domain_config: DomainConfig object from DomainManager
+        agent_factory: AgentFactory instance
+    """
+    st.title("🧪 Experiments")
+    st.markdown("Create and run experiments to evaluate your agent's performance.")
+    
+    # Initialize session state for experiments
+    if "selected_dataset" not in st.session_state:
+        st.session_state.selected_dataset = None
+    if "dataset_loaded" not in st.session_state:
+        st.session_state.dataset_loaded = False
+    if "experiment_running" not in st.session_state:
+        st.session_state.experiment_running = False
+    
+    # Section 1: Dataset Selection/Creation
+    st.header("1️⃣ Dataset Setup")
+    
+    dataset_option = st.radio(
+        "Choose how to setup your dataset:",
+        ["Select Existing Dataset by Name", "Select Existing Dataset by ID", 
+         "Create from Sample Test Data", "Upload CSV File"],
+        key="dataset_option"
+    )
+    
+    # Handle different dataset options
+    if dataset_option == "Select Existing Dataset by Name":
+        render_select_dataset_by_name(domain_name)
+    
+    elif dataset_option == "Select Existing Dataset by ID":
+        render_select_dataset_by_id()
+    
+    elif dataset_option == "Create from Sample Test Data":
+        render_create_from_sample_data(domain_name, domain_config)
+    
+    elif dataset_option == "Upload CSV File":
+        render_upload_csv(domain_name)
+    
+    st.divider()
+    
+    # Section 2: Experiment Configuration (only show if dataset is loaded)
+    if st.session_state.dataset_loaded and st.session_state.selected_dataset:
+        st.header("2️⃣ Experiment Configuration")
+        
+        # Show dataset info with link
+        dataset = st.session_state.selected_dataset
+        dataset_name_display = dataset.name if hasattr(dataset, 'name') else "Selected Dataset"
+        st.info(f"📊 Using Dataset: **{dataset_name_display}**")
+        
+        # Show link to view in Splunk Agent Observability
+        try:
+            console_url = get_sao_app_url()
+            dataset_url = f"{console_url}/datasets/{dataset.id}"
+            st.markdown(f"[🔗 View Dataset in Splunk Agent Observability Console]({dataset_url})")
+        except Exception:
+            pass  # Silently fail if we can't get the URL
+        
+        # Model used for this experiment (same as sidebar selection)
+        experiment_model = st.session_state.get(f"selected_model_{domain_name}") or st.session_state.get(f"domain_config_{domain_name}", {}).get("default_model")
+        experiment_provider = st.session_state.get(f"llm_provider_{domain_name}", "local")
+        provider_label = {
+            "hosted": "OpenAI",
+            "bedrock": "Bedrock",
+            "local": "Ollama",
+        }.get(_normalize_provider(experiment_provider), "Ollama")
+        st.caption(
+            f"Provider: **{provider_label}** | Model: **{experiment_model or 'default'}** (change in sidebar)"
+        )
+        
+        st.markdown("---")
+        
+        # Experiment name (default once per session so user input isn't overwritten on rerun)
+        exp_name_key = f"experiment_name_{domain_name}"
+        if exp_name_key not in st.session_state:
+            st.session_state[exp_name_key] = f"{domain_name}-experiment-{uuid.uuid4().hex[:6]}"
+        experiment_name = st.text_input(
+            "Experiment Name",
+            value=st.session_state[exp_name_key],
+            key=exp_name_key,
+            help="A unique name for this experiment run"
+        )
+        
+        # Metrics selection
+        st.subheader("Select Metrics")
+        st.markdown("Choose which metrics to evaluate:")
+        
+        selected_metrics = {}
+        cols = st.columns(2)
+        for idx, (metric_name, metric_obj) in enumerate(AVAILABLE_METRICS.items()):
+            with cols[idx % 2]:
+                selected_metrics[metric_name] = st.checkbox(
+                    metric_name,
+                    value=True,
+                    key=f"metric_{metric_name}"
+                )
+        
+        # Get selected metrics as list
+        metrics_to_run = [
+            metric_obj for metric_name, metric_obj in AVAILABLE_METRICS.items()
+            if selected_metrics[metric_name]
+        ]
+        
+        st.divider()
+        
+        # Section 3: Run Experiment
+        st.header("3️⃣ Run Experiment")
+        
+        if not metrics_to_run:
+            st.warning("⚠️ Please select at least one metric to run the experiment.")
+        else:
+            st.info(f"📊 Ready to run experiment with {len(metrics_to_run)} metric(s)")
+            
+            if st.button("🚀 Run Experiment", type="primary", disabled=st.session_state.experiment_running):
+                run_experiment_ui(
+                    domain_name=domain_name,
+                    experiment_name=experiment_name,
+                    metrics=metrics_to_run,
+                    agent_factory=agent_factory,
+                    model_name=experiment_model,  # from sidebar; set above in this block
+                    llm_provider=experiment_provider,
+                )
+    else:
+        st.info("👆 Please select or create a dataset to continue.")
+
+
+def render_select_dataset_by_name(domain_name: str):
+    """Render UI for selecting dataset by name."""
+    try:
+        # Get all datasets
+        all_datasets = get_all_datasets()
+        
+        if not all_datasets:
+            st.warning("No datasets found. Please create a dataset first.")
+            return
+        
+        # Create list of dataset names
+        dataset_names = [ds.name for ds in all_datasets]
+        
+        # Default to domain dataset if it exists
+        domain_dataset_name = get_domain_dataset_name(domain_name)
+        default_index = 0
+        if domain_dataset_name in dataset_names:
+            default_index = dataset_names.index(domain_dataset_name)
+        
+        selected_name = st.selectbox(
+            "Select Dataset",
+            dataset_names,
+            index=default_index,
+            help="Choose a dataset to use for the experiment"
+        )
+        
+        if st.button("Load Dataset", key="load_by_name"):
+            with st.spinner("Loading dataset..."):
+                try:
+                    dataset = get_dataset_by_name(selected_name)
+                    st.session_state.selected_dataset = dataset
+                    st.session_state.dataset_loaded = True
+                    st.success(f"✅ Dataset '{selected_name}' loaded successfully!")
+                    
+                    # Show link to view in Splunk Agent Observability
+                    try:
+                        console_url = get_sao_app_url()
+                        dataset_url = f"{console_url}/datasets/{dataset.id}"
+                        st.markdown(f"[📊 View Dataset in Splunk Agent Observability]({dataset_url})")
+                    except Exception:
+                        pass  # Silently fail if we can't get the URL
+                    
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"❌ Error loading dataset: {str(e)}")
+    
+    except Exception as e:
+        st.error(f"❌ Error fetching datasets: {str(e)}")
+
+
+def render_select_dataset_by_id():
+    """Render UI for selecting dataset by ID."""
+    dataset_id = st.text_input(
+        "Dataset ID",
+        help="Enter the Splunk AO dataset ID"
+    )
+    
+    if st.button("Load Dataset", key="load_by_id"):
+        if not dataset_id:
+            st.error("Please enter a dataset ID")
+            return
+        
+        with st.spinner("Loading dataset..."):
+            try:
+                dataset = get_dataset_by_id(dataset_id)
+                st.session_state.selected_dataset = dataset
+                st.session_state.dataset_loaded = True
+                st.success(f"✅ Dataset loaded successfully!")
+                
+                # Show link to view in Splunk Agent Observability
+                try:
+                    console_url = get_sao_app_url()
+                    dataset_url = f"{console_url}/datasets/{dataset.id}"
+                    st.markdown(f"[📊 View Dataset in Splunk Agent Observability]({dataset_url})")
+                except Exception:
+                    pass  # Silently fail if we can't get the URL
+                
+                st.rerun()
+            except Exception as e:
+                st.error(f"❌ Error loading dataset: {str(e)}")
+
+
+def render_create_from_sample_data(domain_name: str, domain_config):
+    """Render UI for creating dataset from domain's sample data."""
+    st.markdown(f"Create a dataset from the **{domain_name}** domain's `dataset.csv` file.")
+    
+    # Get the dataset file path (domain_config is a DomainConfig object)
+    dataset_file = domain_config.dataset_file if hasattr(domain_config, 'dataset_file') else ""
+    
+    if not dataset_file or not os.path.exists(dataset_file):
+        st.error(f"❌ Dataset file not found at: {dataset_file}")
+        return
+    
+    # Preview the data
+    try:
+        preview_data = read_dataset_csv(dataset_file)
+        st.info(f"📄 Found {len(preview_data)} rows in dataset file")
+        
+        # Show preview of first few rows
+        if preview_data:
+            with st.expander("Preview Data"):
+                for i, row in enumerate(preview_data[:3]):
+                    st.markdown(f"**Sample {i+1}:**")
+                    st.markdown(f"- **Input:** {row['input'][:100]}...")
+                    st.markdown(f"- **Output:** {row['output'][:100]}...")
+    except Exception as e:
+        st.error(f"❌ Error reading dataset file: {str(e)}")
+        return
+    
+    # Dataset name input
+    default_name = get_domain_dataset_name(domain_name)
+    dataset_name = st.text_input(
+        "Dataset Name",
+        value=default_name,
+        key="sample_dataset_name",
+        help="Enter a unique name for this dataset"
+    )
+    
+    if st.button("Create Dataset", key="create_from_sample"):
+        if not dataset_name or not dataset_name.strip():
+            st.error("❌ Please enter a dataset name")
+            return
+            
+        with st.spinner("Creating dataset..."):
+            try:
+                dataset = create_domain_dataset(domain_name, dataset_file, custom_name=dataset_name.strip())
+                st.session_state.selected_dataset = dataset
+                st.session_state.dataset_loaded = True
+                st.success(f"✅ Dataset created successfully!")
+                st.success(f"Dataset ID: {dataset.id}")
+                
+                # Show link to view in Splunk Agent Observability
+                try:
+                    console_url = get_sao_app_url()
+                    dataset_url = f"{console_url}/datasets/{dataset.id}"
+                    st.markdown(f"[📊 View Dataset in Splunk Agent Observability]({dataset_url})")
+                except Exception:
+                    pass  # Silently fail if we can't get the URL
+                
+                st.rerun()
+            except Exception as e:
+                st.error(f"❌ Error creating dataset: {str(e)}")
+
+
+def render_upload_csv(domain_name: str):
+    """Render UI for uploading CSV file to create dataset."""
+    st.markdown("Upload a CSV file with `input` and `output` columns.")
+    
+    uploaded_file = st.file_uploader(
+        "Choose a CSV file",
+        type=['csv'],
+        help="CSV file should have 'input' and 'output' columns"
+    )
+    
+    if uploaded_file is not None:
+        try:
+            # Read the uploaded CSV
+            content = uploaded_file.getvalue().decode("utf-8")
+            
+            # Save to temporary file and read
+            import tempfile
+            import csv
+            
+            with tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.csv') as tmp_file:
+                tmp_file.write(content)
+                tmp_path = tmp_file.name
+            
+            try:
+                # Read and preview
+                preview_data = read_dataset_csv(tmp_path)
+                st.info(f"📄 Found {len(preview_data)} rows in uploaded file")
+                
+                # Show preview
+                if preview_data:
+                    with st.expander("Preview Data"):
+                        for i, row in enumerate(preview_data[:3]):
+                            st.markdown(f"**Sample {i+1}:**")
+                            st.markdown(f"- **Input:** {row['input'][:100]}...")
+                            st.markdown(f"- **Output:** {row['output'][:100]}...")
+                
+                # Dataset name input
+                # Use uploaded filename (without extension) as default
+                default_name = os.path.splitext(uploaded_file.name)[0]
+                dataset_name = st.text_input(
+                    "Dataset Name",
+                    value=default_name,
+                    key="upload_dataset_name",
+                    help="Enter a unique name for this dataset"
+                )
+                
+                if st.button("Create Dataset from Upload", key="create_from_upload"):
+                    if not dataset_name or not dataset_name.strip():
+                        st.error("❌ Please enter a dataset name")
+                        return
+                        
+                    with st.spinner("Creating dataset..."):
+                        try:
+                            dataset = create_domain_dataset(domain_name, tmp_path, custom_name=dataset_name.strip())
+                            st.session_state.selected_dataset = dataset
+                            st.session_state.dataset_loaded = True
+                            st.success(f"✅ Dataset created successfully!")
+                            st.success(f"Dataset ID: {dataset.id}")
+                            
+                            # Show link to view in Splunk Agent Observability
+                            try:
+                                console_url = get_sao_app_url()
+                                dataset_url = f"{console_url}/datasets/{dataset.id}"
+                                st.markdown(f"[📊 View Dataset in Splunk Agent Observability]({dataset_url})")
+                            except Exception:
+                                pass  # Silently fail if we can't get the URL
+                            
+                            st.rerun()
+                        except Exception as e:
+                            st.error(f"❌ Error creating dataset: {str(e)}")
+            finally:
+                # Clean up temp file
+                os.unlink(tmp_path)
+                
+        except Exception as e:
+            st.error(f"❌ Error processing uploaded file: {str(e)}")
+
+
+def run_experiment_ui(
+    domain_name: str,
+    experiment_name: str,
+    metrics: list,
+    agent_factory,
+    model_name: str = None,
+    llm_provider: str = "local",
+):
+    """Run the experiment and display results."""
+    st.session_state.experiment_running = True
+    
+    with st.spinner("🔄 Running experiment... This may take a few minutes."):
+        try:
+            results = run_domain_experiment(
+                domain_name=domain_name,
+                experiment_name=experiment_name,
+                dataset=st.session_state.selected_dataset,
+                agent_factory=agent_factory,
+                metrics=metrics,
+                model_name=model_name,
+                llm_provider=llm_provider,
+            )
+            
+            st.session_state.experiment_running = False
+            
+            # Show success message
+            st.success("✅ Experiment completed successfully!")
+            
+            # Get experiment link from results
+            # results contains: {"experiment": experiment_obj, "link": link, "message": message}
+            if isinstance(results, dict):
+                # Try to use the direct link from results
+                experiment_link = results.get("link")
+                experiment_obj = results.get("experiment")
+                
+                if experiment_link:
+                    st.markdown(f"### [📊 View Experiment Results in Splunk Agent Observability]({experiment_link})")
+                elif experiment_obj and hasattr(experiment_obj, 'id'):
+                    # Fallback: construct the link manually
+                    try:
+                        console_url = get_sao_app_url()
+                        project_name = os.environ.get("SPLUNK_AO_PROJECT", "")
+                        
+                        if project_name:
+                            project_id = get_sao_project_id(project_name)
+                            if project_id:
+                                experiment_url = f"{console_url}/project/{project_id}/experiments/{experiment_obj.id}"
+                                st.markdown(f"### [📊 View Experiment Results in Splunk Agent Observability]({experiment_url})")
+                            else:
+                                st.info("View the experiment results in the Splunk Agent Observability Console")
+                        else:
+                            st.info("View the experiment results in the Splunk Agent Observability Console")
+                    except Exception:
+                        st.info("View the experiment results in the Splunk Agent Observability Console")
+                else:
+                    st.info("View the experiment results in the Splunk Agent Observability Console")
+            else:
+                st.info("View the experiment results in the Splunk Agent Observability Console")
+            
+            # Show experiment details
+            with st.expander("Experiment Details"):
+                experiment_details = {
+                    "experiment_name": experiment_name,
+                    "domain": domain_name,
+                    "dataset": st.session_state.selected_dataset.name if hasattr(st.session_state.selected_dataset, 'name') else "Unknown",
+                    "metrics": [m.name for m in metrics],
+                    "project": os.environ.get("SPLUNK_AO_PROJECT", "default")
+                }
+                
+                # Add experiment ID if available
+                if isinstance(results, dict):
+                    experiment_obj = results.get("experiment")
+                    if experiment_obj and hasattr(experiment_obj, 'id'):
+                        experiment_details["experiment_id"] = experiment_obj.id
+                
+                st.json(experiment_details)
+            
+        except Exception as e:
+            st.session_state.experiment_running = False
+            st.error(f"❌ Error running experiment: {str(e)}")
+            import traceback
+            with st.expander("Error Details"):
+                st.code(traceback.format_exc())
+
+
+def multi_domain_agent_app(domain_name: str):
+    """Main agent app - configuration-driven using domain config"""
+    # Load domain configuration first (needed for environment setup)
+    dm = DomainManager()
+    full_config_key = f"full_domain_config_{domain_name}"
+    if full_config_key not in st.session_state:
+        full_config = dm.load_domain_config(domain_name)
+        st.session_state[full_config_key] = full_config.config
+    
+    # Setup environment with domain-specific project (per domain)
+    env_setup_key = f"environment_setup_{domain_name}"
+    if env_setup_key not in st.session_state:
+        setup_environment(
+            domain_name=domain_name,
+            domain_config=st.session_state[full_config_key]
+        )
+        st.session_state[env_setup_key] = True
+
+    # Initialize AgentFactory once
+    if "factory" not in st.session_state:
+        st.session_state.factory = AgentFactory()
+    
+    factory = st.session_state.factory
+    
+    # Load domain configuration for UI settings (per domain)
+    domain_config_key = f"domain_config_{domain_name}"
+    if domain_config_key not in st.session_state:
+        domain_info = factory.get_domain_info(domain_name)
+        st.session_state[domain_config_key] = domain_info
+    
+    # Create tabs at the top of the main page
+    tab1, tab2 = st.tabs(["💬 Chat", "🧪 Experiments"])
+    
+    # Chat Tab
+    with tab1:
+        with st.sidebar:
+            st.subheader("Splunk AO Tracing")
+
+            # Get project and agent stream names from environment variables (set by setup_environment)
+            project_name = os.environ.get("SPLUNK_AO_PROJECT", "")
+            agent_stream_name = os.environ.get("SPLUNK_AO_AGENT_STREAM", "")
+
+            if project_name and agent_stream_name:
+                try:
+                    console_url = get_sao_app_url()
+                    project_id = get_sao_project_id(project_name)
+
+                    if project_id:
+                        agent_stream_id = get_sao_agent_stream_id(project_id, agent_stream_name)
+
+                        if agent_stream_id:
+                            project_url = f"{console_url}/project/{project_id}/agent-streams/{agent_stream_id}"
+                            st.markdown(f"[📊 View traces in Splunk Agent Observability]({project_url})")
+                        else:
+                            st.write("Agent stream not found")
+                    else:
+                        st.write("Project not found")
+
+                except Exception as e:
+                    st.error(f"Error: {str(e)}")
+            else:
+                st.write("Splunk AO project/agent stream not configured")
+
+            st.divider()
+            selected_provider, selected_model = render_model_settings(
+                domain_name, domain_config_key
+            )
+
+            # Agent Control guardrails (always enabled; configured server-side)
+            st.divider()
+            st.subheader("🛡️ Agent Control")
+            st.checkbox(
+                "Guardrails enabled",
+                value=True,
+                disabled=True,
+                help="Guardrails are always enabled in this demo.",
+            )
+            st.caption(
+                "Guardrails are controlled on the Agent Control server. "
+                "Manage controls through the Console UI (or API/SDK)."
+            )
+            
+            # Add Chaos Engineering section
+            st.divider()
+            st.subheader("🔥 Chaos Engineering")
+            st.markdown("Simulate real-world failures to test Splunk Agent Observability.")
+            
+            # Import chaos engine
+            try:
+                from chaos_engine import get_chaos_engine
+                chaos = get_chaos_engine()
+                
+                with st.expander("⚙️ Chaos Controls"):
+                    st.markdown("Enable chaos modes to inject failures:")
+                    
+                    # Tool Instability
+                    tool_instability = st.checkbox(
+                        "🔌 Tool Instability",
+                        value=chaos.tool_instability_enabled,
+                        key=f"chaos_tool_instability_{domain_name}",
+                        help="Fail API calls with 503, timeout, etc."
+                    )
+                    chaos.enable_tool_instability(tool_instability)
+                    
+                    # Sloppiness
+                    sloppiness = st.checkbox(
+                        "🔢 Sloppiness",
+                        value=chaos.sloppiness_enabled,
+                        key=f"chaos_sloppiness_{domain_name}",
+                        help="Corrupt numbers in tool outputs before LLM sees them"
+                    )
+                    chaos.enable_sloppiness(sloppiness)
+                    
+                    # Data Corruption (Random LLM Errors)
+                    data_corruption = st.checkbox(
+                        "💥 Data Corruption",
+                        value=chaos.data_corruption_enabled,
+                        key=f"chaos_data_corruption_{domain_name}",
+                        help="LLM corrupts correct tool data (simulates LLM hallucinations)"
+                    )
+                    chaos.enable_data_corruption(data_corruption)
+                    
+                    # RAG Chaos
+                    rag_chaos = st.checkbox(
+                        "📚 RAG Disconnects",
+                        value=chaos.rag_chaos_enabled,
+                        key=f"chaos_rag_{domain_name}",
+                        help="Simulate vector database connection failures"
+                    )
+                    chaos.enable_rag_chaos(rag_chaos)
+                    
+                    # Rate Limits
+                    rate_limits = st.checkbox(
+                        "⏱️ Rate Limits",
+                        value=chaos.rate_limit_chaos_enabled,
+                        key=f"chaos_rate_limits_{domain_name}",
+                        help="Simulate API rate limit exceeded (429 errors)"
+                    )
+                    chaos.enable_rate_limit_chaos(rate_limits)
+                    
+                    # Show active chaos count
+                    active_count = sum([
+                        chaos.tool_instability_enabled,
+                        chaos.sloppiness_enabled,
+                        chaos.data_corruption_enabled,
+                        chaos.rag_chaos_enabled,
+                        chaos.rate_limit_chaos_enabled
+                    ])
+                    
+                    if active_count > 0:
+                        st.warning(f"🔥 {active_count} chaos mode(s) active")
+                        
+                        # Show statistics
+                        stats = chaos.get_stats()
+                        with st.expander("📊 Chaos Statistics"):
+                            col1, col2 = st.columns(2)
+                            with col1:
+                                st.metric("Tool Instability", stats['tool_instability_count'])
+                                st.metric("Sloppiness", stats['sloppiness_count'])
+                                st.metric("RAG Chaos", stats['rag_chaos_count'])
+                            with col2:
+                                st.metric("Rate Limits", stats['rate_limit_chaos_count'])
+                                st.metric("Data Corruption", stats['data_corruption_count'])
+                            
+                            if st.button("Reset Stats", key=f"reset_chaos_stats_{domain_name}"):
+                                chaos.reset_stats()
+                                st.rerun()
+                    else:
+                        st.info("✅ No chaos active - all systems normal")
+            
+            except ImportError:
+                st.info("Chaos engineering not available (chaos_engine.py not found)")
+            
+            # Add Hallucination Demo section (only if configured)
+            domain_full_config = st.session_state.get(full_config_key, {})
+            has_hallucinations = bool(domain_full_config.get("demo_hallucinations", []))
+            
+            if has_hallucinations:
+                st.divider()
+                st.subheader("Hallucination Demo")
+                st.markdown("Log an intentional hallucination to Splunk Agent Observability.")
+                if st.button("Log Hallucination", key=f"log_hallucination_{domain_name}"):
+                    with st.spinner("Logging hallucination to Splunk Agent Observability..."):
+                        # Use existing logger if a session has been started, otherwise create new
+                        existing_logger = st.session_state.get("sao_logger") if st.session_state.get("sao_session_started", False) else None
+                        
+                        success = log_hallucination_for_domain(
+                            domain_name=domain_name,
+                            domain_config=domain_full_config,
+                            existing_logger=existing_logger,
+                        )
+                        if success:
+                            add_hallucination_interaction_to_chat(domain_full_config)
+                            st.rerun()
+                        else:
+                            st.error("Failed to log hallucination. Check logs for details.")
+
+        render_chat_page(
+            factory,
+            domain_name,
+            selected_provider=selected_provider,
+            selected_model=selected_model,
+        )
+    
+    # Experiments Tab
+    with tab2:
+        # Load the full domain config for experiments
+        dm = DomainManager()
+        full_domain_config = dm.load_domain_config(domain_name)
+        render_experiments_page(domain_name, full_domain_config, factory)
+
+
+def render_chat_page(
+    factory,
+    domain_name: str,
+    *,
+    selected_provider: str,
+    selected_model: str,
+):
+    """Render the chat page."""
+    selected_provider = _normalize_provider(selected_provider)
+    # Extract UI configuration from domain config (per domain)
+    domain_config_key = f"domain_config_{domain_name}"
+    ui_config = st.session_state[domain_config_key].get("ui", {})
+    app_title = ui_config.get("app_title", f"{domain_name.title()} Assistant")
+    example_queries = ui_config.get("example_queries", [
+        "Hello, how can you help me?",
+        "What can you do?"
+    ])
+    
+    # Initialize session ID (per domain)
+    session_id_key = f"session_id_{domain_name}"
+    if session_id_key not in st.session_state:
+        session_id = str(uuid.uuid4())[:10]
+        st.session_state[session_id_key] = session_id
+        st.session_state.session_id = session_id  # Also set the global session_id
+    else:
+        st.session_state.session_id = st.session_state[session_id_key]
+    
+    # Create a per-session SplunkAOLogger so each browser tab writes to its own
+    # SAO session instead of sharing the process-level splunk_ao_context singleton.
+    sao_logger_key = f"sao_logger_{domain_name}"
+    if sao_logger_key not in st.session_state:
+        full_config = st.session_state.get(f"full_domain_config_{domain_name}", {})
+        sao_config = full_config.get("splunk_ao", {})
+        project_name = sao_config.get("project") or f"sao-demo-{domain_name}"
+        agent_stream = sao_config.get("agent_stream", "default")
+        try:
+            sao_logger = create_sao_logger(project_name, agent_stream)
+            sao_logger.enable_agent_control()
+            init_agent_control(
+                sao_logger,
+                project_name=project_name,
+                agent_stream=agent_stream,
+                agent_description=f"{domain_name.title()} demo agent",
+            )
+            st.session_state[sao_logger_key] = sao_logger
+        except Exception as e:
+            print(f"⚠️ Failed to create per-session SplunkAOLogger: {e}")
+            st.session_state[sao_logger_key] = None
+    # Always sync to the generic key so helpers (hallucination demo, etc.) can find it
+    st.session_state.sao_logger = st.session_state[sao_logger_key]
+
+    user_input = orchestrate_streamlit_and_get_user_input(
+        app_title,
+        example_queries[0] if len(example_queries) > 0 else "Hello, how can you help me?",
+        example_queries[1] if len(example_queries) > 1 else "What can you do?",
+        domain_name
+    )
+
+    rag_key = f"rag_initialized_{domain_name}_{selected_provider}"
+    if rag_key not in st.session_state:
+        initialize_rag_systems(domain_name, selected_provider)
+        st.session_state[rag_key] = True
+
+    # Create agent dynamically using AgentFactory - works for any domain!
+    domain_info = st.session_state.get(f"domain_config_{domain_name}", {})
+    available_models, default_model = _models_for_provider(domain_info, selected_provider)
+    if selected_model not in available_models:
+        selected_model = default_model
+        st.session_state[f"selected_model_{domain_name}"] = selected_model
+
+    agent_cache_key = f"agent_{domain_name}_{selected_provider}_{selected_model}"
+    if agent_cache_key not in st.session_state:
+        st.session_state[agent_cache_key] = factory.create_agent(
+            domain=domain_name,
+            framework=FRAMEWORK,
+            session_id=st.session_state.session_id,
+            model_name=selected_model,
+            sao_logger=st.session_state[sao_logger_key],
+            llm_provider=selected_provider,
+        )
+
+    # Set current agent for processing
+    st.session_state.agent = st.session_state[agent_cache_key]
+    
+    process_input_for_simple_app(user_input)
+
+
+def create_domain_page(domain_name: str):
+    """Create a page function for a specific domain"""
+    def page_func():
+        multi_domain_agent_app(domain_name)
+    return page_func
+
+
+def main():
+    """Main app with dynamic routing based on discovered domains"""
+    # Initialize domain manager
+    dm = DomainManager()
+    
+    try:
+        # Auto-discover available domains
+        available_domains = dm.list_domains()
+        
+        if not available_domains:
+            st.error("No domains found! Please create a domain in the 'domains/' directory.")
+            st.info("Example: Create 'domains/finance/config.yaml' with your domain configuration.")
+            st.stop()
+        
+        # Create pages dictionary for st.navigation
+        pages = []
+        
+        # Determine default domain (prefer "finance" if it exists, otherwise first domain)
+        default_domain = "finance" if "finance" in available_domains else available_domains[0]
+        
+        for domain in available_domains:
+            try:
+                domain_info = dm.get_domain_info(domain)
+                ui_config = domain_info.get("ui", {})
+                app_title = ui_config.get("app_title", f"{domain.title()} Assistant")
+                app_icon = ui_config.get("icon", "🤖")  # Default to robot emoji
+                
+                # Create page using st.Page
+                is_default = (domain == default_domain)
+                
+                if is_default:
+                    # Default domain gets both root and named path
+                    # Default page (root URL)
+                    default_page = st.Page(
+                        create_domain_page(domain),
+                        title=app_title,
+                        icon=app_icon,
+                        default=True
+                    )
+                    pages.append(default_page)
+                
+                # Named path for all domains
+                page = st.Page(
+                    create_domain_page(domain),
+                    title=app_title,
+                    url_path=f"/{domain}",
+                    icon=app_icon
+                )
+                pages.append(page)
+                
+            except Exception as e:
+                st.error(f"Error loading domain '{domain}': {str(e)}")
+                continue
+        
+        if not pages:
+            st.error("No valid domains found! Please check your domain configurations.")
+            st.stop()
+        
+        # Create navigation with list of pages - hide navigation for clean demo
+        try:
+            # uncomment this to show the navigation with different pages per domain
+            nav = st.navigation(pages, position="hidden")
+            nav.run()
+        except Exception as nav_error:
+            st.error(f"Navigation error: {str(nav_error)}")
+            st.info(f"Available domains: {available_domains}")
+            st.info(f"Number of pages created: {len(pages)}")
+            # Fallback to default domain
+            if available_domains:
+                st.warning("Falling back to direct domain execution...")
+                multi_domain_agent_app(default_domain)
+        
+    except Exception as e:
+        st.error(f"Error initializing app: {str(e)}")
+        st.info("Please check your domain configurations and try again.")
+
+
+if __name__ == "__main__":
+    main()
