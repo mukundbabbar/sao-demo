@@ -17,11 +17,11 @@ Not a production reference architecture or replacement for customer-specific POC
 ### Prerequisites
 
 - Python 3.8+
-- Access to a Large Language Model
-   - [Ollama](https://ollama.com/) running locally (default: `http://localhost:11434`); or
-   - AWS Bedrock LLM (via `AWS_BEARER_TOKEN_BEDROCK` token)
-   - OpenAI API Key
-- Splunk Agent Observability API key
+- Access to a Large Language Model (any one is enough)
+   - [Ollama](https://ollama.com/) running locally (set `ollama_base_url` in `.streamlit/secrets.toml`); or
+   - AWS Bedrock (set `bedrock_api_key` in `.streamlit/secrets.toml` — the app loads it as `AWS_BEARER_TOKEN_BEDROCK`); or
+   - OpenAI (set `openai_api_key` in `.streamlit/secrets.toml`)
+- Splunk Agent Observability: SaaS needs `splunk_ao_realm` + `splunk_ao_o11y_token`; on-prem needs `splunk_ao_api_key` + `splunk_ao_console_url`
 - PostgreSQL with pgvector (local Docker container or hosted instance)
 
 ### Setup
@@ -29,7 +29,7 @@ Not a production reference architecture or replacement for customer-specific POC
 1. **Clone the repository**
    ```bash
    git clone <repository-url>
-   cd new-golden-demo
+   cd sao-demo
    ```
 
 2. **[Optional] Install Ollama on Mac and pull models**
@@ -131,17 +131,17 @@ Not a production reference architecture or replacement for customer-specific POC
    
    Edit `.streamlit/secrets.toml` with your actual API keys:
    ```toml
-   # Ollama (local LLM — no API key required)
-   ollama_base_url = "http://localhost:11434"
+   # Ollama (optional — uncomment to show Local in the UI)
+   # ollama_base_url = "http://localhost:11434"
    ollama_default_chat_model = "gemma4"
    ollama_embedding_model = "nomic-embed-text"
 
-   # OpenAI (optional — for sidebar "Hosted (OpenAI)" provider)
-   openai_api_key = "your_openai_api_key_here"
+   # OpenAI (optional — uncomment to show Hosted in the UI)
+   # openai_api_key = "your_openai_api_key_here"
 
-   # AWS Bedrock Configuration
-   bedrock_api_key = "..." # Amazon Bedrock API key
-   aws_region = "us-east-1" # AWS region for Bedrock inference
+   # AWS Bedrock — set bedrock_api_key in this file (not AWS_BEARER_TOKEN_BEDROCK)
+   bedrock_api_key = "..." # Amazon Bedrock API key (bearer token; no SigV4 keys)
+   aws_region = "us-east-1"
    bedrock_default_chat_model = "mistral.ministral-3-14b-instruct"
    bedrock_embedding_model = "amazon.titan-embed-text-v2:0"
  
