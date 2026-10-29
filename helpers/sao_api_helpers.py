@@ -139,7 +139,11 @@ def create_sao_logger(project_name: str, agent_stream: str):
     """
     from splunk_ao import SplunkAOLogger
 
-    return SplunkAOLogger(project=project_name, agent_stream=agent_stream)
+    return SplunkAOLogger(
+        project=project_name,
+        agent_stream=agent_stream,
+        mode="batch",
+    )
 
 
 def get_sao_project_id(project_name: str) -> str:

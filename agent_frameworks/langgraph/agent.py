@@ -28,10 +28,10 @@ from base_agent import BaseAgent
 from domain_manager import DomainConfig
 from splunk_ao.handlers.langchain import SplunkAOCallback
 from helpers.agent_control_helpers import (
+    ensure_logger_session,
     ensure_trace_started,
     finalize_trace,
-    isolate_agent_trace_context,
-    restore_agent_trace_context,
+    logger_id_metadata,
     format_blocked_message,
     init_agent_control,
     notify_control_block,
@@ -494,9 +494,17 @@ class LangGraphAgent(BaseAgent):
     ) -> str:
         """Process a user query asynchronously (required for @control async nodes)."""
         provider_token = set_llm_provider(self.llm_provider)
-        otel_token = isolate_agent_trace_context()
         response = "No response generated"
         try:
+            if self.sao_logger and self.session_id:
+                ensure_logger_session(
+                    self.sao_logger,
+                    name=f"{self.domain_config.name.title()} Agent Demo",
+                    external_id=self.session_id,
+                    metadata=metadata,
+                )
+                metadata = logger_id_metadata(self.sao_logger, metadata)
+
             # Load tools if not already loaded (must run under active provider context)
             if not self.tools:
                 self.load_tools()
@@ -527,7 +535,6 @@ class LangGraphAgent(BaseAgent):
         finally:
             if self.sao_logger:
                 finalize_trace(self.sao_logger, response)
-            restore_agent_trace_context(otel_token)
             reset_llm_provider(provider_token)
 
     def process_query(

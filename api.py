@@ -35,11 +35,7 @@ from helpers.sao_api_helpers import (
     get_sao_app_url,
     create_sao_logger,
 )
-from helpers.agent_control_helpers import (
-    init_agent_control,
-    start_demo_session,
-    string_metadata,
-)
+from helpers.agent_control_helpers import init_agent_control, string_metadata
 
 from agent_factory import AgentFactory
 
@@ -168,8 +164,6 @@ class ChatSession:
 
 factory = AgentFactory()
 sessions: Dict[str, ChatSession] = {}
-# browser session_id -> SAO internal session UUID (survives logger recreation)
-_sao_session_ids: Dict[str, str] = {}
 _sessions_lock = threading.Lock()
 
 
@@ -185,14 +179,6 @@ def get_or_create_session(session_id: str) -> ChatSession:
             agent_stream=agent_stream_name,
         )
         logger.enable_agent_control()
-        sao_id = start_demo_session(
-            logger,
-            name=f"{DOMAIN.title()} Agent Demo",
-            external_id=session_id,
-            metadata=_correlation_metadata(session_id, logger),
-        )
-        if sao_id:
-            _sao_session_ids[session_id] = sao_id
         init_agent_control(
             logger,
             project_name=project_name,
@@ -213,55 +199,9 @@ def get_or_create_session(session_id: str) -> ChatSession:
             session_id=session_id,
             logger=logger,
             agent=agent,
-            sao_session_id=sao_id,
         )
         sessions[session_id] = chat_session
         return chat_session
-
-
-def ensure_sao_session(chat_session: ChatSession) -> None:
-    """
-    Attach the logger to the Splunk AO session for this browser visit.
-
-    Splunk AO creates one auto-generated session per trace unless a session is
-    active on the logger. Re-attach before every /query (after flush clears
-    traces) using the cached SAO session id or external_id lookup.
-    """
-    external_id = chat_session.session_id
-    session_name = f"{DOMAIN.title()} Agent Demo"
-    logger = chat_session.logger
-
-    cached_sao_id = _sao_session_ids.get(external_id)
-    if cached_sao_id:
-        logger.set_session(cached_sao_id)
-        chat_session.sao_session_id = cached_sao_id
-        print(
-            f"[api] sao set_session sao_id={cached_sao_id} "
-            f"external_id={external_id}"
-        )
-        return
-
-    sao_id = start_demo_session(
-        logger,
-        name=session_name,
-        external_id=external_id,
-        metadata=_correlation_metadata(external_id, logger),
-    )
-    if not sao_id:
-        sao_id = getattr(logger, "session_id", None)
-
-    if sao_id:
-        _sao_session_ids[external_id] = sao_id
-        chat_session.sao_session_id = sao_id
-        print(
-            f"[api] sao start_session sao_id={sao_id} "
-            f"external_id={external_id}"
-        )
-    else:
-        print(
-            f"[api] WARNING: no SAO session for external_id={external_id}; "
-            "traces will each get their own auto-generated session"
-        )
 
 
 # --------------------------------------------------
@@ -274,13 +214,13 @@ async def query(request_body: QueryRequest, request: Request):
     print(f"[api] /query received session_id={session_id!r} question={request_body.question!r}")
 
     chat_session = get_or_create_session(session_id)
-    ensure_sao_session(chat_session)
 
-    sao_id = chat_session.sao_session_id or getattr(
-        chat_session.logger, "session_id", None
-    )
     trace_metadata = string_metadata(
-        _correlation_metadata(session_id, chat_session.logger, sao_id=sao_id)
+        _correlation_metadata(
+            session_id,
+            chat_session.logger,
+            sao_id=chat_session.sao_session_id,
+        )
     )
     request.state.otel_sao_attrs = trace_metadata
 
@@ -294,6 +234,9 @@ async def query(request_body: QueryRequest, request: Request):
         metadata=trace_metadata,
     )
 
+    chat_session.sao_session_id = getattr(
+        chat_session.logger, "session_id", None
+    ) or chat_session.sao_session_id
     chat_session.messages.append(
         {"role": "assistant", "content": response}
     )

@@ -29,7 +29,7 @@ from helpers.sao_api_helpers import (
     get_sao_project_id,
     get_sao_agent_stream_id,
 )
-from helpers.agent_control_helpers import init_agent_control, start_demo_session
+from helpers.agent_control_helpers import ensure_logger_session, init_agent_control
 from helpers.hallucination_helpers import log_hallucination_for_domain
 from experiments.experiment_helpers import (
     get_all_datasets,
@@ -341,7 +341,11 @@ def process_input_for_simple_app(user_input: str | None):
                 session_name = f"{domain_name.title()} Agent Demo"
                 per_session_logger = st.session_state.get("sao_logger")
                 if per_session_logger:
-                    per_session_logger.start_session(name=session_name, external_id=st.session_state.session_id)
+                    ensure_logger_session(
+                        per_session_logger,
+                        name=session_name,
+                        external_id=st.session_state.session_id,
+                    )
                 st.session_state.sao_session_started = True
             except Exception as e:
                 st.error(f"Failed to start SAO session: {str(e)}")
@@ -1067,13 +1071,6 @@ def render_chat_page(
         try:
             sao_logger = create_sao_logger(project_name, agent_stream)
             sao_logger.enable_agent_control()
-            session_name = f"{domain_name.title()} Agent Demo"
-            start_demo_session(
-                sao_logger,
-                name=session_name,
-                external_id=st.session_state.session_id,
-            )
-            st.session_state.sao_session_started = True
             init_agent_control(
                 sao_logger,
                 project_name=project_name,

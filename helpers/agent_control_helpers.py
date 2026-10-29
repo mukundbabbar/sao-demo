@@ -5,6 +5,7 @@ import functools
 import inspect
 import json
 import os
+import threading
 from typing import Any, Callable, Optional
 
 import agent_control
@@ -111,26 +112,6 @@ def _extract_trace_input(messages) -> str:
     return json.dumps(serialized) if serialized else ""
 
 
-def isolate_agent_trace_context():
-    """Return a token that detaches the FastAPI HTTP span as parent.
-
-    Galileo traces were uploaded as a complete tree on flush() and never used
-    the OTel context. Splunk AO traces are OTel spans, so without this the
-    "Run Agent" trace becomes a child of POST /query and looks partial in SAO.
-    """
-    from opentelemetry import context as otel_context
-
-    return otel_context.attach(otel_context.Context())
-
-
-def restore_agent_trace_context(token) -> None:
-    if token is None:
-        return
-    from opentelemetry import context as otel_context
-
-    otel_context.detach(token)
-
-
 def string_metadata(raw: Optional[dict] = None) -> dict:
     """Flat string metadata for start_session / start_trace (SDK requires str keys/values)."""
     if not raw:
@@ -141,6 +122,22 @@ def string_metadata(raw: Optional[dict] = None) -> dict:
             continue
         metadata[str(key)[:256]] = str(value)[:256]
     return metadata
+
+
+def logger_id_metadata(sao_logger, extra: Optional[dict] = None) -> dict:
+    """Project / agent-stream / session UUIDs from the live logger, not display names."""
+    merged = dict(extra or {})
+    if sao_logger is None:
+        return string_metadata(merged)
+    stream_id = getattr(sao_logger, "agent_stream_id", None) or getattr(
+        sao_logger, "log_stream_id", None
+    )
+    merged.setdefault("splunk_ao.project_id", getattr(sao_logger, "project_id", None))
+    merged.setdefault("splunk_ao.agent_stream_id", stream_id)
+    merged.setdefault(
+        "splunk_ao_user_session_id", getattr(sao_logger, "session_id", None)
+    )
+    return string_metadata(merged)
 
 
 def ensure_trace_started(
@@ -156,7 +153,7 @@ def ensure_trace_started(
         return
     if trace_input is None and messages is not None:
         trace_input = _extract_trace_input(messages)
-    meta = string_metadata(metadata)
+    meta = logger_id_metadata(sao_logger, metadata)
     kwargs = {"input": trace_input or "", "name": trace_name}
     if meta:
         kwargs["metadata"] = meta
@@ -423,6 +420,10 @@ def wrap_controlled_langchain_tool(tool, sao_logger, step_name: str = "retrieval
     )
 
 
+_sao_session_ids: dict[str, str] = {}
+_sao_session_lock = threading.Lock()
+
+
 def start_demo_session(
     sao_logger,
     *,
@@ -430,13 +431,7 @@ def start_demo_session(
     external_id: str,
     metadata: Optional[dict] = None,
 ) -> Optional[str]:
-    """Start or reuse the user-facing SAO session before Agent Control init.
-
-    Docs: session `name` is set here (server assigns one if omitted). Call this
-    before agent_control.init so logger.agent_stream_id is resolved without
-    creating a throwaway session.
-    https://agent-observability-docs.splunk.com/concepts/logging/sessions/using-sessions
-    """
+    """Start or reuse a named SAO session (SDK reuses by external_id)."""
     if sao_logger is None:
         return None
     meta = string_metadata(metadata)
@@ -445,6 +440,40 @@ def start_demo_session(
         kwargs["metadata"] = meta
     session_id = sao_logger.start_session(**kwargs)
     return session_id or getattr(sao_logger, "session_id", None)
+
+
+def ensure_logger_session(
+    sao_logger,
+    *,
+    name: str,
+    external_id: str,
+    metadata: Optional[dict] = None,
+) -> Optional[str]:
+    """Attach this browser visit's session on the current thread, then start traces.
+
+    Galileo kept the session on the logger instance. SAO set_session is ambient
+    for the current thread/async context, and /query runs process_query in a
+    worker thread — so this must run on that same thread as start_trace.
+    https://agent-observability-docs.splunk.com/sdk-api/python/reference/logger/logger
+    """
+    if sao_logger is None or not external_id:
+        return None
+    with _sao_session_lock:
+        cached = _sao_session_ids.get(external_id)
+    if cached:
+        sao_logger.set_session(cached)
+        return cached
+    session_id = start_demo_session(
+        sao_logger,
+        name=name,
+        external_id=external_id,
+        metadata=logger_id_metadata(sao_logger, metadata),
+    )
+    if session_id:
+        with _sao_session_lock:
+            _sao_session_ids[external_id] = session_id
+        sao_logger.set_session(session_id)
+    return session_id
 
 
 def _resolve_agent_stream_id(sao_logger) -> Optional[str]:
