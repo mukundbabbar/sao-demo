@@ -176,7 +176,7 @@ def setup_environment(domain_name: Optional[str] = None, domain_config: Optional
             "AGENT_CONTROL_RUNTIME_TOKEN_HEADER": secrets.get(
                 "agent_control_runtime_token_header", "X-Agent-Control-Runtime-Token"
             ),
-            "AGENT_CONTROL_TARGET_TYPE": secrets.get("agent_control_target_type", "agent_stream"),
+            "AGENT_CONTROL_TARGET_TYPE": secrets.get("agent_control_target_type", "log_stream"),
             "ADMIN_KEY": secrets.get("admin_key", ""),
             "POSTGRES_HOST": os.environ.get("POSTGRES_HOST")
             or secrets.get("postgres_host", "localhost"),

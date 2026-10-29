@@ -423,11 +423,28 @@ def wrap_controlled_langchain_tool(tool, sao_logger, step_name: str = "retrieval
     )
 
 
-def get_agent_control_target(sao_logger) -> Optional[str]:
-    """Resolve the Agent Control target_id from the Splunk AO logger."""
+def _resolve_agent_stream_id(sao_logger) -> Optional[str]:
+    """Return logger.agent_stream_id, resolving names via start_session if needed.
+
+    Docs: target_id must be logger.agent_stream_id, not the stream name, and
+    Splunk AO auto-resolves only log_stream targets.
+    https://agent-observability-docs.splunk.com/how-to-guides/agent-control/initialize-and-configure-agent-control
+    """
     if sao_logger is None:
         return None
-    return getattr(sao_logger, "agent_stream_id", None) or getattr(sao_logger, "log_stream_id", None)
+    target_id = getattr(sao_logger, "agent_stream_id", None) or getattr(
+        sao_logger, "log_stream_id", None
+    )
+    if target_id:
+        return target_id
+    try:
+        sao_logger.start_session(name="Agent Control")
+    except Exception as exc:
+        print(f"⚠️ Agent Control: could not resolve agent stream id: {exc}")
+        return None
+    return getattr(sao_logger, "agent_stream_id", None) or getattr(
+        sao_logger, "log_stream_id", None
+    )
 
 
 def init_agent_control(
@@ -455,7 +472,10 @@ def init_agent_control(
         or os.environ.get("SPLUNK_AO_O11Y_TOKEN")
     )
     api_key_header = os.environ.get("AGENT_CONTROL_API_KEY_HEADER", "Splunk-AO-API-Key")
-    target_type = os.environ.get("AGENT_CONTROL_TARGET_TYPE", "agent_stream")
+    # SAO Agent Control only auto-resolves log_stream targets (stream id, not name).
+    target_type = os.environ.get("AGENT_CONTROL_TARGET_TYPE", "log_stream")
+    if target_type == "agent_stream":
+        target_type = "log_stream"
 
     if not all([server_url, agent_name, api_key]):
         print(
@@ -470,10 +490,17 @@ def init_agent_control(
 
     # Control spans require sao_logger.enable_agent_control() (done in app.py).
 
-    target_id = get_agent_control_target(sao_logger)
+    target_id = _resolve_agent_stream_id(sao_logger)
     if not target_id:
-        print(f"⚠️ Agent Control: failed to resolve agent stream '{agent_stream}'")
+        print(
+            f"⚠️ Agent Control: failed to resolve agent stream '{agent_stream}' "
+            "(need logger.agent_stream_id; controls bind to that UUID as log_stream)"
+        )
         return False
+    os.environ["SPLUNK_AO_AGENT_STREAM_ID"] = target_id
+    project_id = getattr(sao_logger, "project_id", None)
+    if project_id:
+        os.environ["SPLUNK_AO_PROJECT_ID"] = project_id
 
     control_steps = steps or STANDARD_AGENT_CONTROL_STEPS
 
