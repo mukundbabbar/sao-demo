@@ -35,7 +35,11 @@ from helpers.sao_api_helpers import (
     get_sao_app_url,
     create_sao_logger,
 )
-from helpers.agent_control_helpers import init_agent_control, string_metadata
+from helpers.agent_control_helpers import (
+    init_agent_control,
+    start_demo_session,
+    string_metadata,
+)
 
 from agent_factory import AgentFactory
 
@@ -81,6 +85,30 @@ agent_stream_id = get_sao_agent_stream_id(
 
 print("SPLUNK AO PROJECT ID:", project_id)
 print("SPLUNK AO AGENT STREAM ID:", agent_stream_id)
+
+
+def _correlation_metadata(session_id: str, logger=None, sao_id: Optional[str] = None) -> dict:
+    """IDs for start_session / start_trace. Prefer live logger values over import-time lookup."""
+    resolved_project_id = (
+        getattr(logger, "project_id", None) if logger is not None else None
+    ) or project_id
+    resolved_stream_id = (
+        (
+            getattr(logger, "agent_stream_id", None)
+            or getattr(logger, "log_stream_id", None)
+        )
+        if logger is not None
+        else None
+    ) or agent_stream_id
+    return {
+        "splunk_ao.project_id": resolved_project_id,
+        "splunk_ao.agent_stream_id": resolved_stream_id,
+        "splunk_ao.session_id": session_id,
+        "splunk_ao_user_session_id": sao_id,
+        "splunk_ao.url": (
+            f"{console_url}/project/{resolved_project_id}/agent-streams/{resolved_stream_id}"
+        ),
+    }
 
 
 # --------------------------------------------------
@@ -157,6 +185,14 @@ def get_or_create_session(session_id: str) -> ChatSession:
             agent_stream=agent_stream_name,
         )
         logger.enable_agent_control()
+        sao_id = start_demo_session(
+            logger,
+            name=f"{DOMAIN.title()} Agent Demo",
+            external_id=session_id,
+            metadata=_correlation_metadata(session_id, logger),
+        )
+        if sao_id:
+            _sao_session_ids[session_id] = sao_id
         init_agent_control(
             logger,
             project_name=project_name,
@@ -177,6 +213,7 @@ def get_or_create_session(session_id: str) -> ChatSession:
             session_id=session_id,
             logger=logger,
             agent=agent,
+            sao_session_id=sao_id,
         )
         sessions[session_id] = chat_session
         return chat_session
@@ -204,20 +241,11 @@ def ensure_sao_session(chat_session: ChatSession) -> None:
         )
         return
 
-    session_metadata = string_metadata(
-        {
-            "splunk_ao.project_id": project_id,
-            "splunk_ao.agent_stream_id": agent_stream_id,
-            "splunk_ao.session_id": external_id,
-            "splunk_ao.url": (
-                f"{console_url}/project/{project_id}/agent-streams/{agent_stream_id}"
-            ),
-        }
-    )
-    sao_id = logger.start_session(
+    sao_id = start_demo_session(
+        logger,
         name=session_name,
         external_id=external_id,
-        metadata=session_metadata or None,
+        metadata=_correlation_metadata(external_id, logger),
     )
     if not sao_id:
         sao_id = getattr(logger, "session_id", None)
@@ -252,15 +280,7 @@ async def query(request_body: QueryRequest, request: Request):
         chat_session.logger, "session_id", None
     )
     trace_metadata = string_metadata(
-        {
-            "splunk_ao.project_id": project_id,
-            "splunk_ao.agent_stream_id": agent_stream_id,
-            "splunk_ao.session_id": session_id,
-            "splunk_ao_user_session_id": sao_id,
-            "splunk_ao.url": (
-                f"{console_url}/project/{project_id}/agent-streams/{agent_stream_id}"
-            ),
-        }
+        _correlation_metadata(session_id, chat_session.logger, sao_id=sao_id)
     )
     request.state.otel_sao_attrs = trace_metadata
 

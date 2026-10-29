@@ -423,24 +423,38 @@ def wrap_controlled_langchain_tool(tool, sao_logger, step_name: str = "retrieval
     )
 
 
-def _resolve_agent_stream_id(sao_logger) -> Optional[str]:
-    """Return logger.agent_stream_id, resolving names via start_session if needed.
+def start_demo_session(
+    sao_logger,
+    *,
+    name: str,
+    external_id: str,
+    metadata: Optional[dict] = None,
+) -> Optional[str]:
+    """Start or reuse the user-facing SAO session before Agent Control init.
 
-    Docs: target_id must be logger.agent_stream_id, not the stream name, and
-    Splunk AO auto-resolves only log_stream targets.
-    https://agent-observability-docs.splunk.com/how-to-guides/agent-control/initialize-and-configure-agent-control
+    Docs: session `name` is set here (server assigns one if omitted). Call this
+    before agent_control.init so logger.agent_stream_id is resolved without
+    creating a throwaway session.
+    https://agent-observability-docs.splunk.com/concepts/logging/sessions/using-sessions
     """
     if sao_logger is None:
         return None
-    target_id = getattr(sao_logger, "agent_stream_id", None) or getattr(
-        sao_logger, "log_stream_id", None
-    )
-    if target_id:
-        return target_id
-    try:
-        sao_logger.start_session(name="Agent Control")
-    except Exception as exc:
-        print(f"⚠️ Agent Control: could not resolve agent stream id: {exc}")
+    meta = string_metadata(metadata)
+    kwargs = {"name": name, "external_id": external_id}
+    if meta:
+        kwargs["metadata"] = meta
+    session_id = sao_logger.start_session(**kwargs)
+    return session_id or getattr(sao_logger, "session_id", None)
+
+
+def _resolve_agent_stream_id(sao_logger) -> Optional[str]:
+    """Return logger.agent_stream_id (UUID). Do not start a session here.
+
+    Docs: target_id must be logger.agent_stream_id, not the stream name.
+    Starting a session here would name it and steal later traces.
+    https://agent-observability-docs.splunk.com/how-to-guides/agent-control/initialize-and-configure-agent-control
+    """
+    if sao_logger is None:
         return None
     return getattr(sao_logger, "agent_stream_id", None) or getattr(
         sao_logger, "log_stream_id", None
@@ -494,7 +508,7 @@ def init_agent_control(
     if not target_id:
         print(
             f"⚠️ Agent Control: failed to resolve agent stream '{agent_stream}' "
-            "(need logger.agent_stream_id; controls bind to that UUID as log_stream)"
+            "(call start_session first so logger.agent_stream_id is set)"
         )
         return False
     os.environ["SPLUNK_AO_AGENT_STREAM_ID"] = target_id
