@@ -2,7 +2,7 @@
 SAO Demo AI Assistant REST API
 
 Banking UI posts to POST /query. Start with auto-instrumentation so the FastAPI
-HTTP span is exported to Splunk APM (same pattern as galileo-golden-demo):
+HTTP span is exported by the Python OTel agent:
 
     python start_api.py
     # or:

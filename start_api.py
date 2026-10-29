@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Start the banking /query API with OTel auto-instrumentation for Splunk APM.
+"""Start the banking /query API with OTel auto-instrumentation.
 
-Same pattern as galileo-golden-demo: opentelemetry-instrument creates the FastAPI
-HTTP span, api.py stamps Splunk AO correlation attributes onto it, and the OTLP
-exporter sends that span to Splunk APM.
+opentelemetry-instrument creates the FastAPI HTTP span using the Python
+agent's own OTLP defaults. api.py stamps Splunk AO correlation attributes
+onto that span.
 
 Usage:
     python start_api.py
@@ -36,24 +36,10 @@ def _load_secrets() -> dict:
 
 
 def configure_otel_from_secrets() -> None:
-    """Set OTEL_* for the auto-instrumentor. Existing env wins."""
+    """Set OTEL_SERVICE_NAME if present. Leave exporter settings to the agent."""
     secrets = _load_secrets()
-    realm = _secret(secrets, "splunk_ao_realm")
-    token = _secret(secrets, "splunk_ao_o11y_token")
     service = _secret(secrets, "otel_service_name") or "sao-demo-api"
-    endpoint = _secret(secrets, "otel_exporter_otlp_endpoint")
-    if not endpoint and realm:
-        endpoint = f"https://ingest.{realm}.signalfx.com"
-
     os.environ.setdefault("OTEL_SERVICE_NAME", service)
-    os.environ.setdefault("OTEL_TRACES_EXPORTER", "otlp")
-    os.environ.setdefault("OTEL_METRICS_EXPORTER", "none")
-    os.environ.setdefault("OTEL_LOGS_EXPORTER", "none")
-    os.environ.setdefault("OTEL_EXPORTER_OTLP_PROTOCOL", "http/protobuf")
-    if endpoint:
-        os.environ.setdefault("OTEL_EXPORTER_OTLP_ENDPOINT", endpoint)
-    if token:
-        os.environ.setdefault("OTEL_EXPORTER_OTLP_HEADERS", f"X-SF-TOKEN={token}")
 
 
 def main() -> None:
