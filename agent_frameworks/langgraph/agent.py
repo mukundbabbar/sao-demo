@@ -34,9 +34,6 @@ except ImportError:
     SplunkAOAsyncCallback = SplunkAOCallback
 from helpers.agent_control_helpers import (
     attach_control_bridge,
-    ensure_logger_session,
-    ensure_trace_started,
-    finalize_trace,
     format_blocked_message,
     init_agent_control,
     notify_control_block,
@@ -49,7 +46,7 @@ from helpers.agent_control_helpers import (
     extract_steering_instructions,
     build_steer_correction_prompt,
 )
-from helpers.sao_otel import isolate_http_parent, restore_otel_context
+from helpers.sao_otel import run_agent_span
 
 # Streamlit import (optional - for UI integration)
 try:
@@ -527,63 +524,47 @@ class LangGraphAgent(BaseAgent):
         """Process a user query asynchronously (required for @control async nodes)."""
         provider_token = set_llm_provider(self.llm_provider)
         response = "No response generated"
-        http_token = isolate_http_parent()
         try:
-            # No custom session name. A name created empty "AI Assistant" next
-            # to auto "session". Detach POST /query so this trace is complete
-            # rather than Partial, and the session view lists the interactions.
-            if self.sao_logger:
-                sao_id = ensure_logger_session(
-                    self.sao_logger,
-                    name=None,
-                    external_id=self.session_id,
-                    metadata=metadata,
-                )
-                self.sao_session_id = sao_id
-                print(
-                    f"[sao] worker session sao_id={sao_id} "
-                    f"external_id={self.session_id!r} "
-                    f"project_id={getattr(self.sao_logger, 'project_id', None)!r} "
-                    f"agent_stream_id={getattr(self.sao_logger, 'agent_stream_id', None)!r}"
-                )
-                self.sao_logger.enable_agent_control()
-                project_name, agent_stream = self._sao_project_stream()
-                init_agent_control(
-                    self.sao_logger,
-                    project_name=project_name,
-                    agent_stream=agent_stream,
-                    agent_description=f"{self.domain_config.name.title()} demo agent",
-                )
+            # Do not call start_session/start_trace here. Those created the
+            # extra empty unnamed session. The default session named "session"
+            # is created by the callback/OTel tree. Wrap in Run Agent so
+            # @control is a child, matching Galileo.
+            with run_agent_span("Run Agent") as run_span:
+                if metadata:
+                    for key, value in metadata.items():
+                        if value is not None and value != "":
+                            run_span.set_attribute(str(key), str(value))
 
-            if not self.tools:
-                self.load_tools()
+                if self.sao_logger:
+                    self.sao_logger.enable_agent_control()
+                    project_name, agent_stream = self._sao_project_stream()
+                    init_agent_control(
+                        self.sao_logger,
+                        project_name=project_name,
+                        agent_stream=agent_stream,
+                        agent_description=f"{self.domain_config.name.title()} demo agent",
+                    )
 
-            self.graph = self._build_graph()
+                if not self.tools:
+                    self.load_tools()
 
-            langchain_messages = []
-            for msg in messages:
-                if msg["role"] == "user":
-                    langchain_messages.append(HumanMessage(content=msg["content"]))
-                elif msg["role"] == "assistant":
-                    langchain_messages.append(AIMessage(content=msg["content"]))
+                self.graph = self._build_graph()
 
-            initial_state = {"messages": langchain_messages, "steer_attempts": 0}
-            ensure_trace_started(
-                self.sao_logger,
-                langchain_messages,
-                trace_name="Run Agent",
-                metadata=metadata,
-            )
-            attach_control_bridge(self.sao_logger)
-            result = await self.graph.ainvoke(initial_state, self.config)
-            if result["messages"]:
-                response = message_content_to_text(result["messages"][-1].content)
-            return response
+                langchain_messages = []
+                for msg in messages:
+                    if msg["role"] == "user":
+                        langchain_messages.append(HumanMessage(content=msg["content"]))
+                    elif msg["role"] == "assistant":
+                        langchain_messages.append(AIMessage(content=msg["content"]))
+
+                initial_state = {"messages": langchain_messages, "steer_attempts": 0}
+                attach_control_bridge(self.sao_logger)
+                result = await self.graph.ainvoke(initial_state, self.config)
+                if result["messages"]:
+                    response = message_content_to_text(result["messages"][-1].content)
+                return response
         finally:
-            restore_otel_context(http_token)
             reset_llm_provider(provider_token)
-            if self.sao_logger:
-                finalize_trace(self.sao_logger, response)
 
     async def process_query_async(
         self, messages: List[Dict[str, str]], metadata: Optional[dict] = None
