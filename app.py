@@ -18,6 +18,7 @@ load_dotenv()
 if not os.getenv('_SAO_ENV_LOADED'):
     setup_environment()
     os.environ['_SAO_ENV_LOADED'] = 'true'
+init_sao_otel()
 
 from agent_factory import AgentFactory
 from domain_manager import DomainManager
@@ -30,6 +31,7 @@ from helpers.sao_api_helpers import (
     get_sao_agent_stream_id,
 )
 from helpers.agent_control_helpers import init_agent_control
+from helpers.sao_otel import init_sao_otel
 from helpers.hallucination_helpers import log_hallucination_for_domain
 from experiments.experiment_helpers import (
     get_all_datasets,
@@ -828,6 +830,7 @@ def multi_domain_agent_app(domain_name: str):
             domain_config=st.session_state[full_config_key]
         )
         st.session_state[env_setup_key] = True
+        init_sao_otel()
 
     # Initialize AgentFactory once
     if "factory" not in st.session_state:

@@ -6,6 +6,7 @@ import inspect
 import json
 import os
 import threading
+from contextvars import ContextVar, Token
 from typing import Any, Callable, Optional
 
 import agent_control
@@ -13,6 +14,9 @@ from agent_control import ControlSteerError, ControlViolationError, control
 from agent_control.settings import configure_settings
 
 _initialized = False
+_correlation_attrs: ContextVar[dict] = ContextVar("sao_otel_corr", default={})
+_correlation_attrs_fallback: dict = {}
+_processor_provider_ids: set[int] = set()
 MAX_STEER_RETRIES = 3
 STEER_EXHAUSTED_MESSAGE = (
     "Agent could not complete the request after "
@@ -112,6 +116,92 @@ def _extract_trace_input(messages) -> str:
     return json.dumps(serialized) if serialized else ""
 
 
+class _CorrelationSpanProcessor:
+    """Stamp IDs on every OTel span SAO actually exports (invoke_agent, PII, …)."""
+
+    def on_start(self, span, parent_context=None):
+        attrs = _correlation_attrs.get() or _correlation_attrs_fallback
+        if not attrs or span is None:
+            return
+        set_attr = getattr(span, "set_attribute", None)
+        if set_attr is None:
+            return
+        for key, value in attrs.items():
+            if value is None or value == "":
+                continue
+            try:
+                set_attr(str(key), str(value))
+            except Exception:
+                continue
+        print(
+            f"[otel] processor on_start span={getattr(span, 'name', None)!r} "
+            f"attrs={attrs}"
+        )
+
+    def on_end(self, span):
+        return None
+
+    def shutdown(self):
+        return None
+
+    def force_flush(self, timeout_millis=0):
+        return True
+
+
+def register_correlation_processor() -> None:
+    """Attach the correlation processor to every TracerProvider we can find.
+
+    SAO may replace the global provider after logger/AC init, so this is
+    idempotent per provider id and should be called again after start_trace.
+    """
+    from opentelemetry import trace as otel_trace
+
+    providers = []
+    provider = otel_trace.get_tracer_provider()
+    if provider is not None:
+        providers.append(provider)
+        for attr in ("_tracer_provider", "_provider", "tracer_provider"):
+            inner = getattr(provider, attr, None)
+            if inner is not None and inner not in providers:
+                providers.append(inner)
+
+    attached = False
+    for candidate in providers:
+        pid = id(candidate)
+        if pid in _processor_provider_ids:
+            attached = True
+            continue
+        adder = getattr(candidate, "add_span_processor", None)
+        if adder is None:
+            print(f"[otel] no add_span_processor on {type(candidate).__name__}")
+            continue
+        adder(_CorrelationSpanProcessor())
+        _processor_provider_ids.add(pid)
+        attached = True
+        print(f"[otel] registered correlation processor on {type(candidate).__name__}")
+    if not attached:
+        print("[otel] correlation processor not attached (no TracerProvider yet)")
+
+
+def set_correlation_attrs(attrs: Optional[dict]) -> Token:
+    global _correlation_attrs_fallback
+    register_correlation_processor()
+    data = dict(attrs or {})
+    _correlation_attrs_fallback = data
+    return _correlation_attrs.set(data)
+
+
+def reset_correlation_attrs(token: Optional[Token]) -> None:
+    global _correlation_attrs_fallback
+    _correlation_attrs_fallback = {}
+    if token is None:
+        return
+    try:
+        _correlation_attrs.reset(token)
+    except Exception:
+        pass
+
+
 def stamp_otel_attributes(
     attrs: Optional[dict],
     *,
@@ -139,6 +229,38 @@ def stamp_otel_attributes(
         f"trace_id={format(ctx.trace_id, '032x') if ctx and ctx.trace_id else None} "
         f"attrs={stamped}"
     )
+
+
+def stamp_logger_parent(sao_logger, attrs: Optional[dict], *, where: str = "sao-parent") -> None:
+    """Stamp OTel attributes on the SAO parent span object, if it wraps one."""
+    if not sao_logger:
+        print(f"[otel] skip stamp {where}: no logger")
+        return
+    try:
+        parent = sao_logger.current_parent()
+    except Exception as exc:
+        print(f"[otel] skip stamp {where}: current_parent error {exc}")
+        return
+    if parent is None:
+        print(f"[otel] skip stamp {where}: no SAO parent")
+        return
+    print(
+        f"[otel] {where} type={type(parent).__name__} "
+        f"name={getattr(parent, 'name', None)!r}"
+    )
+    seen: set[int] = set()
+    stack = [parent]
+    while stack:
+        obj = stack.pop()
+        if obj is None or id(obj) in seen:
+            continue
+        seen.add(id(obj))
+        if callable(getattr(obj, "set_attribute", None)):
+            stamp_otel_attributes(attrs, where=where, span=obj)
+        for attr in ("span", "_span", "otel_span", "_otel_span", "current_span"):
+            child = getattr(obj, attr, None)
+            if child is not None and id(child) not in seen:
+                stack.append(child)
 
 
 def string_metadata(raw: Optional[dict] = None) -> dict:
@@ -201,6 +323,25 @@ def logger_id_metadata(sao_logger, extra: Optional[dict] = None) -> dict:
     if ids["session_id"]:
         merged["splunk_ao_user_session_id"] = ids["session_id"]
         merged["sao_session_id"] = ids["session_id"]
+        merged["splunk_ao.session.id"] = ids["session_id"]
+    project_name = os.environ.get("SPLUNK_AO_PROJECT")
+    agent_stream_name = os.environ.get("SPLUNK_AO_AGENT_STREAM")
+    if project_name:
+        merged["splunk_ao.project.name"] = project_name
+    if agent_stream_name:
+        merged["splunk_ao.agentstream.name"] = agent_stream_name
+    project_id = ids["project_id"] or merged.get("splunk_ao.project_id")
+    stream_id = ids["agent_stream_id"] or merged.get("splunk_ao.agent_stream_id")
+    if project_id and stream_id:
+        realm = os.environ.get("SPLUNK_AO_REALM", "")
+        console = (
+            os.environ.get("SPLUNK_AO_CONSOLE_URL")
+            or (f"https://app.{realm}.observability.splunkcloud.com" if realm else "")
+        ).rstrip("/")
+        if console:
+            merged["splunk_ao.url"] = (
+                f"{console}/project/{project_id}/agent-streams/{stream_id}"
+            )
     return string_metadata(merged)
 
 
@@ -232,6 +373,9 @@ def ensure_trace_started(
     if meta:
         kwargs["metadata"] = meta
     sao_logger.start_trace(**kwargs)
+    register_correlation_processor()
+    stamp_otel_attributes(meta, where="after start_trace")
+    stamp_logger_parent(sao_logger, meta, where="after start_trace")
 
 
 def finalize_trace(sao_logger, output: str) -> None:
@@ -656,7 +800,11 @@ def init_agent_control(
         server_url=server_url,
         api_key=api_key,
         api_key_header=api_key_header,
-        observability_enabled=True,
+        # False: @control still evaluates, but does not create an OTel parent
+        # named after the control (PII_...). Galileo traces were not OTel, so
+        # that parent never appeared there. Control leaves still come from
+        # logger.enable_agent_control() after start_trace.
+        observability_enabled=False,
         observability_sink_name="registered",
         target_type=target_type,
         target_id=target_id,
@@ -664,6 +812,7 @@ def init_agent_control(
     )
     _initialized = True
     init_agent_control._last_session_key = session_key
+    register_correlation_processor()
     step_names = ", ".join(s["name"] for s in control_steps)
     print(
         f"✅ Agent Control initialized for agent '{agent_name}' "

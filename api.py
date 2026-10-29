@@ -35,7 +35,12 @@ from helpers.sao_api_helpers import (
     get_sao_app_url,
     create_sao_logger,
 )
-from helpers.agent_control_helpers import init_agent_control, string_metadata
+from helpers.agent_control_helpers import (
+    ensure_logger_session,
+    init_agent_control,
+    string_metadata,
+)
+from helpers.sao_otel import init_sao_otel
 
 from agent_factory import AgentFactory
 
@@ -58,6 +63,8 @@ if not os.getenv("_SAO_ENV_LOADED"):
     )
 
     os.environ["_SAO_ENV_LOADED"] = "true"
+
+init_sao_otel()
 
 
 # --------------------------------------------------
@@ -178,6 +185,7 @@ def get_or_create_session(session_id: str) -> ChatSession:
             project_name=project_name,
             agent_stream=agent_stream_name,
         )
+        logger.enable_agent_control()
         init_agent_control(
             logger,
             project_name=project_name,
@@ -213,6 +221,20 @@ async def query(request_body: QueryRequest, request: Request):
     print(f"[api] /query received session_id={session_id!r} question={request_body.question!r}")
 
     chat_session = get_or_create_session(session_id)
+    session_name = f"{DOMAIN.title()} Agent Demo"
+    ensure_logger_session(
+        chat_session.logger,
+        name=session_name,
+        external_id=session_id,
+        metadata=_correlation_metadata(
+            session_id,
+            chat_session.logger,
+            sao_id=chat_session.sao_session_id,
+        ),
+    )
+    chat_session.sao_session_id = getattr(
+        chat_session.logger, "session_id", None
+    ) or chat_session.sao_session_id
 
     trace_metadata = string_metadata(
         _correlation_metadata(

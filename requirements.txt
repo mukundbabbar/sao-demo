@@ -7,6 +7,11 @@ opentelemetry-distro
 opentelemetry-exporter-otlp
 opentelemetry-instrumentation-fastapi
 opentelemetry-instrumentation-asgi
+opentelemetry-instrumentation-sqlalchemy
+opentelemetry-instrumentation-psycopg
+opentelemetry-instrumentation-httpx
+openinference-instrumentation-bedrock
+openinference-instrumentation-openai
 splunk-ao[langchain]
 agent-control-sdk>=8.5.0
 agent-control-evaluators>=8.5.0

@@ -28,7 +28,6 @@ from langgraph.prebuilt import ToolNode, tools_condition
 from agent_control import ControlSteerError, ControlViolationError, control
 from base_agent import BaseAgent
 from domain_manager import DomainConfig
-from splunk_ao import splunk_ao_context
 from splunk_ao.handlers.langchain import SplunkAOCallback
 
 try:
@@ -39,6 +38,8 @@ from helpers.agent_control_helpers import (
     attach_control_bridge,
     ensure_logger_session,
     ensure_trace_started,
+    reset_correlation_attrs,
+    set_correlation_attrs,
     stamp_otel_attributes,
     finalize_trace,
     logger_id_metadata,
@@ -551,79 +552,72 @@ class LangGraphAgent(BaseAgent):
         """Process a user query asynchronously (required for @control async nodes)."""
         provider_token = set_llm_provider(self.llm_provider)
         response = "No response generated"
-        project_name, agent_stream = self._sao_project_stream()
         session_name = f"{self.domain_config.name.title()} Agent Demo"
-        # @control and the LangChain callback log through splunk_ao_context, not a
-        # private SplunkAOLogger. start_session on a private logger created the
-        # empty "Bank Agent Demo"; traces landed on the context logger as "session".
-        with splunk_ao_context(project=project_name, agent_stream=agent_stream):
-            logger = splunk_ao_context.get_logger_instance()
-            try:
-                if self.session_id:
-                    ensure_logger_session(
-                        logger,
-                        name=session_name,
-                        external_id=self.session_id,
-                        metadata=metadata,
-                    )
-                    metadata = logger_id_metadata(logger, metadata)
-                logger.enable_agent_control()
-                self.sao_logger = logger
-                self.config = self._callback_config(logger, otel_attrs=metadata)
-
-                # Load tools if not already loaded (must run under active provider context)
-                if not self.tools:
-                    self.load_tools()
-
-                self.graph = self._build_graph()
-
-                langchain_messages = []
-                for msg in messages:
-                    if msg["role"] == "user":
-                        langchain_messages.append(HumanMessage(content=msg["content"]))
-                    elif msg["role"] == "assistant":
-                        langchain_messages.append(AIMessage(content=msg["content"]))
-
-                initial_state = {"messages": langchain_messages, "steer_attempts": 0}
-                ensure_trace_started(
+        logger = self.sao_logger
+        corr_token = None
+        try:
+            # Same logger the callback was built with. Do not open
+            # splunk_ao_context — that created a second empty "Bank Agent Demo".
+            if logger and self.session_id:
+                ensure_logger_session(
                     logger,
-                    langchain_messages,
-                    trace_name="Run Agent",
+                    name=session_name,
+                    external_id=self.session_id,
                     metadata=metadata,
                 )
                 metadata = logger_id_metadata(logger, metadata)
-                self.config = self._callback_config(logger, otel_attrs=metadata)
-                attach_control_bridge(logger)
+                corr_token = set_correlation_attrs(metadata)
 
-                # @control starts an OTel span named after the control
-                # (PII_Input_output_Luna-clone). If that is the current span, it
-                # becomes the trace root and LangGraph nests under it. Galileo
-                # traces were not OTel, so this did not happen there.
-                # https://agent-observability-docs.splunk.com/sdk-api/python/reference/handlers/agent_control/bridge
-                async def _ainvoke():
-                    stamp_otel_attributes(metadata, where="ainvoke")
-                    return await self.graph.ainvoke(initial_state, self.config)
+            if not self.tools:
+                self.load_tools()
 
-                current = otel_trace.get_current_span()
-                if current is not None and current.is_recording():
-                    stamp_otel_attributes(metadata, where="current", span=current)
+            self.graph = self._build_graph()
+
+            langchain_messages = []
+            for msg in messages:
+                if msg["role"] == "user":
+                    langchain_messages.append(HumanMessage(content=msg["content"]))
+                elif msg["role"] == "assistant":
+                    langchain_messages.append(AIMessage(content=msg["content"]))
+
+            initial_state = {"messages": langchain_messages, "steer_attempts": 0}
+            ensure_trace_started(
+                logger,
+                langchain_messages,
+                trace_name="Run Agent",
+                metadata=metadata,
+            )
+            metadata = logger_id_metadata(logger, metadata)
+            corr_token = set_correlation_attrs(metadata)
+            # Recreate the callback after start_session/start_trace so it does
+            # not auto-open a second session named "session".
+            self.config = self._callback_config(logger, otel_attrs=metadata)
+            attach_control_bridge(logger)
+
+            # logger.start_trace is not an OTel current span (console:
+            # "skip stamp ... no recording span"). Client instrumentors
+            # (Bedrock, Postgres) only nest when a recording span is current.
+            async def _ainvoke():
+                return await self.graph.ainvoke(initial_state, self.config)
+
+            current = otel_trace.get_current_span()
+            if current is not None and current.is_recording():
+                stamp_otel_attributes(metadata, where="current", span=current)
+                result = await _ainvoke()
+            else:
+                with otel_trace.get_tracer("sao-demo").start_as_current_span(
+                    "Run Agent"
+                ) as run_span:
+                    stamp_otel_attributes(metadata, where="Run Agent", span=run_span)
                     result = await _ainvoke()
-                else:
-                    with otel_trace.get_tracer("sao-demo").start_as_current_span(
-                        "Run Agent"
-                    ) as run_span:
-                        stamp_otel_attributes(
-                            metadata, where="Run Agent", span=run_span
-                        )
-                        result = await _ainvoke()
-                if result["messages"]:
-                    # ChatBedrockConverse returns .content as a list of blocks;
-                    # normalize to a string so downstream (UI/tracing) stays str-based.
-                    response = message_content_to_text(result["messages"][-1].content)
-                return response
-            finally:
+            if result["messages"]:
+                response = message_content_to_text(result["messages"][-1].content)
+            return response
+        finally:
+            if logger:
                 finalize_trace(logger, response)
-                reset_llm_provider(provider_token)
+            reset_correlation_attrs(corr_token)
+            reset_llm_provider(provider_token)
 
     async def process_query_async(
         self, messages: List[Dict[str, str]], metadata: Optional[dict] = None
