@@ -28,7 +28,6 @@ from langgraph.prebuilt import ToolNode, tools_condition
 from agent_control import ControlSteerError, ControlViolationError, control
 from base_agent import BaseAgent
 from domain_manager import DomainConfig
-from splunk_ao import splunk_ao_context
 from splunk_ao.handlers.langchain import SplunkAOCallback
 
 try:
@@ -75,6 +74,38 @@ from .langgraph_rag import create_domain_rag_tool
 class State(TypedDict):
     messages: Annotated[list, add_messages]
     steer_attempts: int
+
+
+def _bind_sao_callback(sao_logger):
+    """Attach LangGraph to the logger that already has start_session.
+
+    SAO experiments pass the logger as the first positional argument.
+    https://agent-observability-docs.splunk.com/sdk-api/third-party-integrations/langchain/experiments
+    """
+    kwargs = {"start_new_trace": False, "flush_on_chain_end": False}
+    try:
+        params = [
+            name
+            for name in inspect.signature(SplunkAOAsyncCallback.__init__).parameters
+            if name != "self"
+        ]
+    except (TypeError, ValueError):
+        params = []
+    first = params[0] if params else ""
+    if first in ("splunk_ao_logger", "logger", "_splunk_ao_logger"):
+        callback = SplunkAOAsyncCallback(sao_logger, **kwargs)
+    elif "splunk_ao_logger" in params:
+        callback = SplunkAOAsyncCallback(splunk_ao_logger=sao_logger, **kwargs)
+    else:
+        try:
+            callback = SplunkAOAsyncCallback(sao_logger, **kwargs)
+        except TypeError:
+            callback = SplunkAOAsyncCallback(splunk_ao_logger=sao_logger, **kwargs)
+    print(
+        f"[sao] callback bound logger_id={id(sao_logger)} "
+        f"first_param={first!r} callback={type(callback).__name__}"
+    )
+    return callback
 
 
 def _run_async(coro):
@@ -269,22 +300,7 @@ class LangGraphAgent(BaseAgent):
 
     def _callback_config(self, sao_logger, otel_attrs: Optional[dict] = None) -> dict:
         """ainvoke requires the async callback; otherwise traces go to a second logger."""
-        # Experiments docs pass the logger as the first positional argument.
-        # splunk_ao_logger= is ignored; the callback then uses the singleton
-        # and auto-creates a session named "session".
-        # https://agent-observability-docs.splunk.com/sdk-api/third-party-integrations/langchain/experiments
-        try:
-            sao_callback = SplunkAOAsyncCallback(
-                sao_logger,
-                start_new_trace=False,
-                flush_on_chain_end=False,
-            )
-        except TypeError:
-            sao_callback = SplunkAOAsyncCallback(
-                splunk_ao_logger=sao_logger,
-                start_new_trace=False,
-                flush_on_chain_end=False,
-            )
+        sao_callback = _bind_sao_callback(sao_logger)
         callbacks = [sao_callback]
         if otel_attrs:
             callbacks.append(OtelCorrelationCallback(otel_attrs))
@@ -565,10 +581,7 @@ class LangGraphAgent(BaseAgent):
         provider_token = set_llm_provider(self.llm_provider)
         response = "No response generated"
         session_name = "AI Assistant"
-        # Callback/AC default to the context singleton. start_session on a
-        # private SplunkAOLogger created the empty "AI Assistant".
-        logger = splunk_ao_context.get_logger_instance() or self.sao_logger
-        self.sao_logger = logger
+        logger = self.sao_logger
         corr_token = None
         http_token = isolate_http_parent()
         try:

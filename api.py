@@ -36,6 +36,7 @@ from helpers.sao_api_helpers import (
     create_sao_logger,
 )
 from helpers.agent_control_helpers import (
+    ensure_logger_session,
     init_agent_control,
     string_metadata,
 )
@@ -195,6 +196,14 @@ def get_or_create_session(session_id: str) -> ChatSession:
             project_name=project_name,
             agent_stream=agent_stream_name,
         )
+        # Agent Control needs logger.agent_stream_id, which the SDK sets on
+        # start_session. Use the same logger the LangChain callback will get.
+        ensure_logger_session(
+            logger,
+            name="AI Assistant",
+            external_id=session_id,
+            metadata=_correlation_metadata(session_id, logger),
+        )
         logger.enable_agent_control()
         init_agent_control(
             logger,
@@ -231,6 +240,19 @@ async def query(request_body: QueryRequest, request: Request):
     print(f"[api] /query received session_id={session_id!r} question={request_body.question!r}")
 
     chat_session = get_or_create_session(session_id)
+    ensure_logger_session(
+        chat_session.logger,
+        name="AI Assistant",
+        external_id=session_id,
+        metadata=_correlation_metadata(
+            session_id,
+            chat_session.logger,
+            sao_id=chat_session.sao_session_id,
+        ),
+    )
+    chat_session.sao_session_id = getattr(
+        chat_session.logger, "session_id", None
+    ) or chat_session.sao_session_id
 
     trace_metadata = string_metadata(
         _correlation_metadata(
