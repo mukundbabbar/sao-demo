@@ -10,6 +10,7 @@ opentelemetry-instrumentation-asgi
 splunk-ao[langchain]
 agent-control-sdk>=8.5.0
 agent-control-evaluators>=8.5.0
+agent-control-evaluator-galileo>=8.5.0
 yfinance
 alpha-vantage
 chromadb

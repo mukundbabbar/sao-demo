@@ -53,14 +53,18 @@ def _derive_sao_api_url(console_url: str, explicit_url: str = "") -> str:
 
 
 def _derive_agent_control_url(console_url: str, explicit_url: str = "", realm: str = "") -> str:
-    """Derive Agent Control proxy URL from console URL or SaaS realm."""
+    """Derive Agent Control URL.
+
+    SaaS (O11y): https://app.{realm}.observability.splunkcloud.com/ao/agent-control
+    On-prem: {console_url}/api/agent-control
+    """
     if explicit_url:
         return explicit_url.rstrip("/")
+    if realm:
+        return f"https://app.{realm}.observability.splunkcloud.com/ao/agent-control"
     console_url = (console_url or "").rstrip("/")
     if console_url:
         return f"{console_url}/api/agent-control"
-    if realm:
-        return f"https://app.{realm}.observability.splunkcloud.com/api/agent-control"
     return ""
 
 
@@ -128,6 +132,15 @@ def setup_environment(domain_name: Optional[str] = None, domain_config: Optional
             )
             use_saas = False
         agent_control_api_key = on_prem_key if use_on_prem else (o11y_api_token or o11y_token)
+        explicit_ac_header = str(secrets.get("agent_control_api_key_header", "") or "").strip()
+        if use_saas:
+            agent_control_header = (
+                explicit_ac_header
+                if explicit_ac_header and explicit_ac_header != "Splunk-AO-API-Key"
+                else "X-SF-Token"
+            )
+        else:
+            agent_control_header = explicit_ac_header or "Splunk-AO-API-Key"
 
         env_vars = {
             "OLLAMA_BASE_URL": secrets.get("ollama_base_url", ""),
@@ -158,8 +171,11 @@ def setup_environment(domain_name: Optional[str] = None, domain_config: Optional
             "AGENT_CONTROL_URL": agent_control_url,
             "AGENT_CONTROL_API_KEY": agent_control_api_key,
             "AGENT_CONTROL_AGENT_NAME": secrets.get("agent_control_agent_name", ""),
-            "AGENT_CONTROL_API_KEY_HEADER": secrets.get("agent_control_api_key_header", "Splunk-AO-API-Key"),
+            "AGENT_CONTROL_API_KEY_HEADER": agent_control_header,
             "AGENT_CONTROL_RUNTIME_AUTH_MODE": secrets.get("agent_control_runtime_auth_mode", "jwt"),
+            "AGENT_CONTROL_RUNTIME_TOKEN_HEADER": secrets.get(
+                "agent_control_runtime_token_header", "X-Agent-Control-Runtime-Token"
+            ),
             "AGENT_CONTROL_TARGET_TYPE": secrets.get("agent_control_target_type", "agent_stream"),
             "ADMIN_KEY": secrets.get("admin_key", ""),
             "POSTGRES_HOST": os.environ.get("POSTGRES_HOST")
