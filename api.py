@@ -222,6 +222,12 @@ async def query(request_body: QueryRequest, request: Request):
             sao_id=chat_session.sao_session_id,
         )
     )
+    print(f"[api] /query correlation metadata={trace_metadata}")
+    print(
+        f"[api] /query logger ids project_id={getattr(chat_session.logger, 'project_id', None)!r} "
+        f"agent_stream_id={getattr(chat_session.logger, 'agent_stream_id', None)!r} "
+        f"session_id={getattr(chat_session.logger, 'session_id', None)!r}"
+    )
     request.state.otel_sao_attrs = trace_metadata
 
     chat_session.messages.append(

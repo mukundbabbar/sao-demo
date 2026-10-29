@@ -29,7 +29,7 @@ from helpers.sao_api_helpers import (
     get_sao_project_id,
     get_sao_agent_stream_id,
 )
-from helpers.agent_control_helpers import ensure_logger_session, init_agent_control
+from helpers.agent_control_helpers import init_agent_control
 from helpers.hallucination_helpers import log_hallucination_for_domain
 from experiments.experiment_helpers import (
     get_all_datasets,
@@ -336,20 +336,10 @@ def process_input_for_simple_app(user_input: str | None):
         # Uses the per-session SplunkAOLogger (set in render_chat_page) so each browser
         # tab has its own isolated SAO session rather than sharing a global context.
         if not st.session_state.sao_session_started:
-            try:
-                domain_name = st.session_state.get("domain_name", "default")
-                session_name = f"{domain_name.title()} Agent Demo"
-                per_session_logger = st.session_state.get("sao_logger")
-                if per_session_logger:
-                    ensure_logger_session(
-                        per_session_logger,
-                        name=session_name,
-                        external_id=st.session_state.session_id,
-                    )
-                st.session_state.sao_session_started = True
-            except Exception as e:
-                st.error(f"Failed to start SAO session: {str(e)}")
-                st.stop()
+            # Session + first trace are started inside process_query on the
+            # worker thread (SAO set_session is thread-local; starting here
+            # created an empty "Bank Agent Demo" next to auto session "session").
+            st.session_state.sao_session_started = True
         
         # Add user message to chat history
         user_message = HumanMessage(content=user_input)

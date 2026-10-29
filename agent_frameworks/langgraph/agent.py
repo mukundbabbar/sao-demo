@@ -28,6 +28,7 @@ from base_agent import BaseAgent
 from domain_manager import DomainConfig
 from splunk_ao.handlers.langchain import SplunkAOCallback
 from helpers.agent_control_helpers import (
+    attach_control_bridge,
     ensure_logger_session,
     ensure_trace_started,
     finalize_trace,
@@ -525,6 +526,7 @@ class LangGraphAgent(BaseAgent):
                 trace_name="Run Agent",
                 metadata=metadata,
             )
+            attach_control_bridge(self.sao_logger)
 
             result = await self.graph.ainvoke(initial_state, self.config)
             if result["messages"]:

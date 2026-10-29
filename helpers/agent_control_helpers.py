@@ -124,19 +124,54 @@ def string_metadata(raw: Optional[dict] = None) -> dict:
     return metadata
 
 
+def _logger_ids(sao_logger) -> dict:
+    if sao_logger is None:
+        return {
+            "project_id": None,
+            "agent_stream_id": None,
+            "session_id": None,
+            "current_parent": None,
+        }
+    parent = None
+    try:
+        parent = sao_logger.current_parent()
+        parent = getattr(parent, "name", None) or parent
+    except Exception as exc:
+        parent = f"<error {exc}>"
+    return {
+        "project_id": getattr(sao_logger, "project_id", None),
+        "agent_stream_id": getattr(sao_logger, "agent_stream_id", None)
+        or getattr(sao_logger, "log_stream_id", None),
+        "session_id": getattr(sao_logger, "session_id", None),
+        "current_parent": parent,
+    }
+
+
+def debug_sao(prefix: str, sao_logger=None, extra: Optional[dict] = None) -> None:
+    ids = _logger_ids(sao_logger)
+    print(
+        f"[sao] {prefix} "
+        f"project_id={ids['project_id']!r} "
+        f"agent_stream_id={ids['agent_stream_id']!r} "
+        f"session_id={ids['session_id']!r} "
+        f"current_parent={ids['current_parent']!r} "
+        f"metadata={extra}"
+    )
+
+
 def logger_id_metadata(sao_logger, extra: Optional[dict] = None) -> dict:
     """Project / agent-stream / session UUIDs from the live logger, not display names."""
     merged = dict(extra or {})
-    if sao_logger is None:
-        return string_metadata(merged)
-    stream_id = getattr(sao_logger, "agent_stream_id", None) or getattr(
-        sao_logger, "log_stream_id", None
-    )
-    merged.setdefault("splunk_ao.project_id", getattr(sao_logger, "project_id", None))
-    merged.setdefault("splunk_ao.agent_stream_id", stream_id)
-    merged.setdefault(
-        "splunk_ao_user_session_id", getattr(sao_logger, "session_id", None)
-    )
+    ids = _logger_ids(sao_logger)
+    if ids["project_id"]:
+        merged["splunk_ao.project_id"] = ids["project_id"]
+        merged["project_id"] = ids["project_id"]
+    if ids["agent_stream_id"]:
+        merged["splunk_ao.agent_stream_id"] = ids["agent_stream_id"]
+        merged["agent_stream_id"] = ids["agent_stream_id"]
+    if ids["session_id"]:
+        merged["splunk_ao_user_session_id"] = ids["session_id"]
+        merged["sao_session_id"] = ids["session_id"]
     return string_metadata(merged)
 
 
@@ -149,11 +184,21 @@ def ensure_trace_started(
     metadata: Optional[dict] = None,
 ) -> None:
     """Start a Splunk AO trace when none is active (required before add_llm_span)."""
-    if not sao_logger or sao_logger.current_parent() is not None:
+    if not sao_logger:
+        print("[sao] start_trace skipped: no logger")
+        return
+    parent = None
+    try:
+        parent = sao_logger.current_parent()
+    except Exception:
+        parent = None
+    if parent is not None:
+        debug_sao("start_trace skipped (parent already active)", sao_logger, metadata)
         return
     if trace_input is None and messages is not None:
         trace_input = _extract_trace_input(messages)
     meta = logger_id_metadata(sao_logger, metadata)
+    debug_sao(f"start_trace name={trace_name!r}", sao_logger, meta)
     kwargs = {"input": trace_input or "", "name": trace_name}
     if meta:
         kwargs["metadata"] = meta
@@ -457,23 +502,46 @@ def ensure_logger_session(
     https://agent-observability-docs.splunk.com/sdk-api/python/reference/logger/logger
     """
     if sao_logger is None or not external_id:
+        print(f"[sao] ensure_logger_session skipped logger={sao_logger} external_id={external_id!r}")
         return None
     with _sao_session_lock:
         cached = _sao_session_ids.get(external_id)
     if cached:
         sao_logger.set_session(cached)
+        debug_sao(f"set_session cached name={name!r} external_id={external_id!r}", sao_logger, metadata)
         return cached
+    session_meta = logger_id_metadata(sao_logger, metadata)
+    debug_sao(f"start_session name={name!r} external_id={external_id!r}", sao_logger, session_meta)
     session_id = start_demo_session(
         sao_logger,
         name=name,
         external_id=external_id,
-        metadata=logger_id_metadata(sao_logger, metadata),
+        metadata=session_meta,
     )
     if session_id:
         with _sao_session_lock:
             _sao_session_ids[external_id] = session_id
         sao_logger.set_session(session_id)
+    debug_sao(f"start_session result sao_id={session_id!r}", sao_logger, session_meta)
     return session_id
+
+
+def attach_control_bridge(sao_logger) -> None:
+    """Register the Agent Control bridge on this thread after start_trace.
+
+    Control spans are leaves on the active Splunk AO parent. If the bridge is
+    missing, @control emits a standalone OTel span named after the control
+    (e.g. PII_Input_output_Luna-clone) and SAO auto-creates a session named
+    "session". Galileo's enable_agent_control() attached those as children of
+    Run Agent instead.
+    https://agent-observability-docs.splunk.com/sdk-api/python/reference/handlers/agent_control/bridge
+    """
+    if sao_logger is None:
+        return
+    try:
+        sao_logger.enable_agent_control()
+    except Exception as exc:
+        print(f"⚠️ Agent Control bridge not attached: {exc}")
 
 
 def _resolve_agent_stream_id(sao_logger) -> Optional[str]:
