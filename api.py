@@ -185,8 +185,6 @@ class ChatSession:
 
 factory = AgentFactory()
 sessions: Dict[str, ChatSession] = {}
-# browser session_id -> SAO internal session UUID (same cache as Galileo)
-_sao_session_ids: Dict[str, str] = {}
 _sessions_lock = threading.Lock()
 
 
@@ -221,16 +219,6 @@ def get_or_create_session(session_id: str) -> ChatSession:
         return chat_session
 
 
-def ensure_sao_session(chat_session: ChatSession) -> None:
-    """Galileo started the session here. SAO session is thread-local, so
-    process_query starts it on the worker with this name + external_id.
-    """
-    chat_session.agent.sao_session_name = "AI Assistant"
-    cached = _sao_session_ids.get(chat_session.session_id)
-    if cached:
-        chat_session.sao_session_id = cached
-
-
 # --------------------------------------------------
 # API endpoint
 # --------------------------------------------------
@@ -241,15 +229,14 @@ async def query(request_body: QueryRequest, request: Request):
     print(f"[api] /query received session_id={session_id!r} question={request_body.question!r}")
 
     chat_session = get_or_create_session(session_id)
-    ensure_sao_session(chat_session)
 
     chat_session.messages.append(
         {"role": "user", "content": request_body.question}
     )
 
-    # Galileo ran process_query off the request thread so the HTTP span is
-    # not the agent parent. SAO start_session also happens inside process_query
-    # (session is thread-local; starting it here left AI Assistant empty).
+    # Run the agent off the request thread (as Galileo did) so the HTTP span is
+    # not the agent parent. The Splunk AO session is just the tab's conversation
+    # id, set inside process_query (no start_session -> no empty extra session).
     response = await asyncio.to_thread(
         chat_session.agent.process_query,
         chat_session.messages,
@@ -265,8 +252,6 @@ async def query(request_body: QueryRequest, request: Request):
     chat_session.sao_session_id = getattr(
         chat_session.agent, "sao_session_id", None
     ) or chat_session.sao_session_id
-    if chat_session.sao_session_id:
-        _sao_session_ids[session_id] = chat_session.sao_session_id
 
     trace_metadata = string_metadata(
         _correlation_metadata(

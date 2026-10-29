@@ -14,10 +14,7 @@ from agent_control import ControlSteerError, ControlViolationError, control
 from agent_control.settings import configure_settings
 
 _initialized = False
-_correlation_attrs: ContextVar[dict] = ContextVar("sao_otel_corr", default={})
-_correlation_attrs_fallback: dict = {}
 _active_sao_logger: ContextVar[Any] = ContextVar("active_sao_logger", default=None)
-_processor_provider_ids: set[int] = set()
 MAX_STEER_RETRIES = 3
 STEER_EXHAUSTED_MESSAGE = (
     "Agent could not complete the request after "
@@ -117,52 +114,6 @@ def _extract_trace_input(messages) -> str:
     return json.dumps(serialized) if serialized else ""
 
 
-try:
-    from opentelemetry.sdk.trace import SpanProcessor as _OtelSpanProcessor
-except Exception:  # pragma: no cover - API-only environments
-    class _OtelSpanProcessor:  # type: ignore[no-redef]
-        pass
-
-
-class _CorrelationSpanProcessor(_OtelSpanProcessor):
-    """Stamp IDs on every OTel span SAO actually exports (invoke_agent, PII, …)."""
-
-    def on_start(self, span, parent_context=None):
-        try:
-            attrs = _correlation_attrs.get() or _correlation_attrs_fallback
-            if not attrs or span is None:
-                return
-            set_attr = getattr(span, "set_attribute", None)
-            if set_attr is None:
-                return
-            for key, value in attrs.items():
-                if value is None or value == "":
-                    continue
-                try:
-                    set_attr(str(key), str(value))
-                except Exception:
-                    continue
-            print(
-                f"[otel] processor on_start span={getattr(span, 'name', None)!r} "
-                f"attrs={attrs}"
-            )
-        except Exception as exc:
-            print(f"[otel] processor on_start failed: {exc}")
-
-    def on_end(self, span):
-        return None
-
-    def _on_ending(self, span):
-        # OTel SDK 1.38+ calls _on_ending instead of on_end on custom processors.
-        return self.on_end(span)
-
-    def shutdown(self):
-        return None
-
-    def force_flush(self, timeout_millis=0):
-        return True
-
-
 def set_active_sao_logger(sao_logger) -> Token:
     """Bind this request's SplunkAOLogger for tools that cannot see Streamlit state."""
     return _active_sao_logger.set(sao_logger)
@@ -192,121 +143,6 @@ def streamlit_sao_logger(key: str):
         return st.session_state.get(key)
     except Exception:
         return None
-
-
-def register_correlation_processor() -> None:
-    """Attach the correlation processor to every TracerProvider we can find.
-
-    SAO may replace the global provider after logger/AC init, so this is
-    idempotent per provider id and should be called again after start_trace.
-    """
-    from opentelemetry import trace as otel_trace
-
-    providers = []
-    provider = otel_trace.get_tracer_provider()
-    if provider is not None:
-        providers.append(provider)
-        for attr in ("_tracer_provider", "_provider", "tracer_provider"):
-            inner = getattr(provider, attr, None)
-            if inner is not None and inner not in providers:
-                providers.append(inner)
-
-    attached = False
-    for candidate in providers:
-        pid = id(candidate)
-        if pid in _processor_provider_ids:
-            attached = True
-            continue
-        adder = getattr(candidate, "add_span_processor", None)
-        if adder is None:
-            print(f"[otel] no add_span_processor on {type(candidate).__name__}")
-            continue
-        adder(_CorrelationSpanProcessor())
-        _processor_provider_ids.add(pid)
-        attached = True
-        print(f"[otel] registered correlation processor on {type(candidate).__name__}")
-    if not attached:
-        print("[otel] correlation processor not attached (no TracerProvider yet)")
-
-
-def set_correlation_attrs(attrs: Optional[dict]) -> Token:
-    global _correlation_attrs_fallback
-    register_correlation_processor()
-    data = dict(attrs or {})
-    _correlation_attrs_fallback = data
-    return _correlation_attrs.set(data)
-
-
-def reset_correlation_attrs(token: Optional[Token]) -> None:
-    global _correlation_attrs_fallback
-    _correlation_attrs_fallback = {}
-    if token is None:
-        return
-    try:
-        _correlation_attrs.reset(token)
-    except Exception:
-        pass
-
-
-def stamp_otel_attributes(
-    attrs: Optional[dict],
-    *,
-    where: str = "",
-    span=None,
-) -> None:
-    """Set correlation IDs on the live OpenTelemetry span (not SAO metadata)."""
-    from opentelemetry import trace as otel_trace
-
-    if span is None:
-        span = otel_trace.get_current_span()
-    if span is None or not span.is_recording():
-        print(f"[otel] skip stamp {where}: no recording span")
-        return
-    ctx = span.get_span_context()
-    name = getattr(span, "name", None) or where
-    stamped = {}
-    for key, value in (attrs or {}).items():
-        if value is None or value == "":
-            continue
-        span.set_attribute(str(key), str(value))
-        stamped[str(key)] = str(value)
-    print(
-        f"[otel] stamped {where} span={name!r} "
-        f"trace_id={format(ctx.trace_id, '032x') if ctx and ctx.trace_id else None} "
-        f"attrs={stamped}"
-    )
-
-
-def stamp_logger_parent(sao_logger, attrs: Optional[dict], *, where: str = "sao-parent") -> None:
-    """Stamp OTel attributes on the SAO parent span object, if it wraps one."""
-    if not sao_logger:
-        print(f"[otel] skip stamp {where}: no logger")
-        return
-    try:
-        parent = sao_logger.current_parent()
-    except Exception as exc:
-        print(f"[otel] skip stamp {where}: current_parent error {exc}")
-        return
-    if parent is None:
-        print(f"[otel] skip stamp {where}: no SAO parent")
-        return
-    print(
-        f"[otel] {where} type={type(parent).__name__} "
-        f"name={getattr(parent, 'name', None)!r}"
-    )
-    seen: set[int] = set()
-    stack = [parent]
-    while stack:
-        obj = stack.pop()
-        if obj is None or id(obj) in seen:
-            continue
-        seen.add(id(obj))
-        if callable(getattr(obj, "set_attribute", None)):
-            stamp_otel_attributes(attrs, where=where, span=obj)
-        for attr in ("span", "_span", "otel_span", "_otel_span", "current_span"):
-            child = getattr(obj, attr, None)
-            if child is not None and id(child) not in seen:
-                stack.append(child)
 
 
 def string_metadata(raw: Optional[dict] = None) -> dict:
@@ -399,37 +235,40 @@ def ensure_trace_started(
     trace_name: str = "Run Agent",
     metadata: Optional[dict] = None,
 ) -> None:
-    """Start a Splunk AO trace when none is active (required before add_llm_span)."""
+    """Open the trace and a root "Run Agent" workflow span.
+
+    start_trace() alone is an internal envelope that Splunk AO never exports, so
+    the first exported span (a control) became the visible root. The workflow
+    span is the exported root: LangChain nodes and Agent Control spans nest
+    under it. Exported as "invoke_workflow Run Agent" (SDK naming convention).
+    https://agent-observability-docs.splunk.com/sdk-api/third-party-integrations/langchain/langchain
+    """
     if not sao_logger:
         print("[sao] start_trace skipped: no logger")
         return
-    parent = None
     try:
-        parent = sao_logger.current_parent()
+        if sao_logger.current_parent() is not None:
+            debug_sao("start_trace skipped (parent already active)", sao_logger, metadata)
+            return
     except Exception:
-        parent = None
-    if parent is not None:
-        debug_sao("start_trace skipped (parent already active)", sao_logger, metadata)
-        return
+        pass
     if trace_input is None and messages is not None:
         trace_input = _extract_trace_input(messages)
-    meta = logger_id_metadata(sao_logger, metadata)
-    debug_sao(f"start_trace name={trace_name!r}", sao_logger, meta)
-    kwargs = {"input": trace_input or "", "name": trace_name}
-    if meta:
-        kwargs["metadata"] = meta
-    sao_logger.start_trace(**kwargs)
-    register_correlation_processor()
-    stamp_otel_attributes(meta, where="after start_trace")
-    stamp_logger_parent(sao_logger, meta, where="after start_trace")
+    debug_sao(f"start_trace name={trace_name!r}", sao_logger, metadata)
+    sao_logger.start_trace(input=trace_input or "", name=trace_name)
+    sao_logger.add_workflow_span(input=trace_input or "", name=trace_name)
 
 
 def finalize_trace(sao_logger, output: str) -> None:
-    """Conclude and flush the active trace after a query completes."""
-    if not sao_logger or sao_logger.current_parent() is None:
+    """Conclude the Run Agent span and trace, then flush."""
+    if not sao_logger:
         return
-    sao_logger.conclude(output=output)
-    sao_logger.flush()
+    try:
+        if sao_logger.current_parent() is None:
+            return
+        sao_logger.conclude(output=output, conclude_all=True)
+    finally:
+        sao_logger.flush()
 
 
 def notify_control_block(
@@ -684,78 +523,17 @@ def wrap_controlled_langchain_tool(tool, sao_logger, step_name: str = "retrieval
     )
 
 
-_sao_session_ids: dict[str, str] = {}
-_sao_session_lock = threading.Lock()
+def bind_conversation(sao_logger, conversation_id: str) -> None:
+    """Group this logger's spans into one Splunk AO session, without start_session().
 
-
-def start_demo_session(
-    sao_logger,
-    *,
-    name: Optional[str] = None,
-    external_id: str,
-    metadata: Optional[dict] = None,
-) -> Optional[str]:
-    """Start or reuse a session (SDK reuses by external_id). Name is omitted so
-    the server keeps the default "session" instead of a second empty name.
+    start_session() creates a separate session record (the empty extra session).
+    Spans are grouped by gen_ai.conversation.id, which set_session() just
+    records on the logger; no network call, no new session record.
     https://agent-observability-docs.splunk.com/sdk-api/python/reference/logger/logger
     """
-    if sao_logger is None:
-        return None
-    meta = string_metadata(metadata)
-    kwargs = {"external_id": external_id}
-    if name:
-        kwargs["name"] = name
-    if meta:
-        kwargs["metadata"] = meta
-    session_id = sao_logger.start_session(**kwargs)
-    return session_id or getattr(sao_logger, "session_id", None)
-
-
-def _persist_logger_ids(sao_logger) -> None:
-    """Cache resolved project/stream UUIDs for Agent Control on later threads."""
-    if sao_logger is None:
+    if sao_logger is None or not conversation_id:
         return
-    project_id = getattr(sao_logger, "project_id", None)
-    stream_id = (
-        getattr(sao_logger, "agent_stream_id", None)
-        or getattr(sao_logger, "log_stream_id", None)
-    )
-    if project_id:
-        os.environ["SPLUNK_AO_PROJECT_ID"] = str(project_id)
-    if stream_id:
-        os.environ["SPLUNK_AO_AGENT_STREAM_ID"] = str(stream_id)
-
-
-def ensure_logger_session(
-    sao_logger,
-    *,
-    name: Optional[str] = None,
-    external_id: str,
-    metadata: Optional[dict] = None,
-) -> Optional[str]:
-    """Start or reuse the named session on this thread (SAO session is thread-local).
-
-    Must run on the same thread as start_trace / ainvoke. external_id reuses
-    one session per browser tab.
-    https://agent-observability-docs.splunk.com/concepts/logging/sessions/using-sessions
-    """
-    if sao_logger is None or not external_id:
-        print(f"[sao] ensure_logger_session skipped logger={sao_logger} external_id={external_id!r}")
-        return None
-    session_meta = logger_id_metadata(sao_logger, metadata)
-    debug_sao(f"start_session name={name!r} external_id={external_id!r}", sao_logger, session_meta)
-    session_id = start_demo_session(
-        sao_logger,
-        name=name,
-        external_id=external_id,
-        metadata=session_meta,
-    )
-    if session_id:
-        with _sao_session_lock:
-            _sao_session_ids[external_id] = session_id
-        _persist_logger_ids(sao_logger)
-    debug_sao(f"start_session result sao_id={session_id!r}", sao_logger, session_meta)
-    return session_id
+    sao_logger.set_session(conversation_id)
 
 
 def attach_control_bridge(sao_logger) -> None:
@@ -839,7 +617,7 @@ def init_agent_control(
     if not target_id:
         print(
             f"⚠️ Agent Control: failed to resolve agent stream '{agent_stream}' "
-            "(call start_session first so logger.agent_stream_id is set)"
+            "(project/agent stream IDs were not resolved; check SPLUNK_AO_* credentials)"
         )
         return False
     os.environ["SPLUNK_AO_AGENT_STREAM_ID"] = target_id
@@ -869,7 +647,6 @@ def init_agent_control(
     )
     _initialized = True
     init_agent_control._last_session_key = session_key
-    register_correlation_processor()
     step_names = ", ".join(s["name"] for s in control_steps)
     print(
         f"✅ Agent Control initialized for agent '{agent_name}' "

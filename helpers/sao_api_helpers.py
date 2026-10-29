@@ -133,17 +133,36 @@ def get_sao_api_key() -> str:
     return api_key
 
 
-def create_sao_logger(project_name: str, agent_stream: str):
+def resolve_logger_ids(logger) -> None:
+    """Fill logger.project_id / agent_stream_id without starting a session.
+
+    In SaaS (O11y) mode the SDK defers the name -> UUID lookup until the first
+    session call. Agent Control needs logger.agent_stream_id up front, and
+    start_session() would create a separate (empty) session record, so resolve
+    the IDs directly. Names are looked up (or created) via the SDK's own helper.
+    """
+    if getattr(logger, "project_id", None) and getattr(logger, "agent_stream_id", None):
+        return
+    try:
+        logger._ensure_session_crud_client()
+    except Exception as exc:
+        print(f"⚠️ Could not resolve Splunk AO project/agent stream IDs: {exc}")
+
+
+def create_sao_logger(project_name: str, agent_stream: str, resolve_ids: bool = True):
     """
     Create a SplunkAOLogger for an existing project/agent stream.
     """
     from splunk_ao import SplunkAOLogger
 
-    return SplunkAOLogger(
+    logger = SplunkAOLogger(
         project=project_name,
         agent_stream=agent_stream,
         mode="batch",
     )
+    if resolve_ids:
+        resolve_logger_ids(logger)
+    return logger
 
 
 def get_sao_project_id(project_name: str) -> str:

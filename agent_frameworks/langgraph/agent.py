@@ -34,7 +34,7 @@ except ImportError:
     SplunkAOAsyncCallback = SplunkAOCallback
 from helpers.agent_control_helpers import (
     attach_control_bridge,
-    ensure_logger_session,
+    bind_conversation,
     ensure_trace_started,
     finalize_trace,
     format_blocked_message,
@@ -48,11 +48,13 @@ from helpers.agent_control_helpers import (
     STEER_EXHAUSTED_MESSAGE,
     extract_steering_instructions,
     build_steer_correction_prompt,
+    logger_id_metadata,
     reset_active_sao_logger,
     set_active_sao_logger,
 )
 from helpers.sao_otel import (
-    activate_sao_parent,
+    conversation_id_for,
+    install_span_attributes,
     isolate_http_parent,
     restore_otel_context,
 )
@@ -77,21 +79,17 @@ class State(TypedDict):
 
 
 def _bind_sao_callback(sao_logger):
-    """Same pattern as GalileoCallback(galileo_logger=...): one logger, no new session."""
-    kwargs = {"start_new_trace": False, "flush_on_chain_end": False}
-    try:
-        callback = SplunkAOAsyncCallback(splunk_ao_logger=sao_logger, **kwargs)
-    except TypeError:
-        callback = SplunkAOAsyncCallback(sao_logger, **kwargs)
-    for obj in (callback, getattr(callback, "_handler", None)):
-        if obj is None:
-            continue
-        for attr in ("_splunk_ao_logger", "splunk_ao_logger", "_logger", "logger"):
-            try:
-                setattr(obj, attr, sao_logger)
-            except Exception:
-                continue
-    return callback
+    """Same pattern as GalileoCallback(galileo_logger=...): one logger, no new trace.
+
+    start_new_trace=False makes the LangChain handler nest under whatever
+    logger.current_parent() is (our "Run Agent" span).
+    https://agent-observability-docs.splunk.com/sdk-api/third-party-integrations/langchain/langchain
+    """
+    return SplunkAOAsyncCallback(
+        splunk_ao_logger=sao_logger,
+        start_new_trace=False,
+        flush_on_chain_end=False,
+    )
 
 
 def _run_async(coro):
@@ -252,8 +250,7 @@ class LangGraphAgent(BaseAgent):
         self.model_override = model_override
         self.sao_logger = sao_logger
         self.llm_provider = llm_provider if llm_provider in ("local", "hosted", "bedrock") else "local"
-        self.sao_session_name = "AI Assistant"
-        self.sao_session_id = None
+        self.sao_session_id = None  # Splunk AO conversation id of this tab
 
         # Same as Galileo: bind the per-session logger once. start_new_trace=False
         # attaches LangGraph spans to logger.start_trace("Run Agent").
@@ -534,30 +531,27 @@ class LangGraphAgent(BaseAgent):
         provider_token = set_llm_provider(self.llm_provider)
         response = "No response generated"
         http_token = isolate_http_parent()
-        parent_token = None
         logger_token = None
         try:
-            # SAO session is thread-local. Galileo stored it on the logger so
-            # api.py could start_session on the FastAPI thread. Do the whole
-            # sequence here, same thread as ainvoke:
-            # start_session → Agent Control → start_trace("Run Agent") → invoke
-            # https://agent-observability-docs.splunk.com/how-to-guides/agent-control/initialize-and-configure-agent-control
             if self.sao_logger:
                 logger_token = set_active_sao_logger(self.sao_logger)
-                sao_id = ensure_logger_session(
+                # One Splunk AO session per browser tab: group spans by a stable
+                # conversation id. No start_session() -> no extra empty session.
+                self.sao_session_id = conversation_id_for(self.session_id or "default")
+                bind_conversation(self.sao_logger, self.sao_session_id)
+                # Plain OTel attributes on every span SAO exports for this run.
+                span_attrs = logger_id_metadata(
                     self.sao_logger,
-                    name=getattr(self, "sao_session_name", None) or "AI Assistant",
-                    external_id=self.session_id,
-                    metadata=metadata,
+                    {
+                        **(metadata or {}),
+                        "splunk_ao_user_session_id": self.sao_session_id,
+                        "sao_session_id": self.sao_session_id,
+                        "splunk_ao.session.id": self.sao_session_id,
+                    },
                 )
-                self.sao_session_id = sao_id
-                print(
-                    f"[sao] worker session sao_id={sao_id} "
-                    f"name={getattr(self, 'sao_session_name', None)!r} "
-                    f"external_id={self.session_id!r} "
-                    f"project_id={getattr(self.sao_logger, 'project_id', None)!r} "
-                    f"agent_stream_id={getattr(self.sao_logger, 'agent_stream_id', None)!r}"
-                )
+                holder = install_span_attributes(self.sao_logger)
+                holder.clear()
+                holder.update(span_attrs)
                 project_name, agent_stream = self._sao_project_stream()
                 init_agent_control(
                     self.sao_logger,
@@ -585,14 +579,12 @@ class LangGraphAgent(BaseAgent):
                 trace_name="Run Agent",
                 metadata=metadata,
             )
-            parent_token = activate_sao_parent(self.sao_logger)
             attach_control_bridge(self.sao_logger)
             result = await self.graph.ainvoke(initial_state, self.config)
             if result["messages"]:
                 response = message_content_to_text(result["messages"][-1].content)
             return response
         finally:
-            restore_otel_context(parent_token)
             if self.sao_logger:
                 finalize_trace(self.sao_logger, response)
             restore_otel_context(http_token)
