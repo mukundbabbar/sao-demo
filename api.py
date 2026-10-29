@@ -202,9 +202,6 @@ def get_or_create_session(session_id: str) -> ChatSession:
             agent_stream=agent_stream_name,
         )
         logger.enable_agent_control()
-        # Agent Control needs logger.agent_stream_id, which SAO only sets after
-        # start_session. That call happens on the worker in process_query.
-        # https://agent-observability-docs.splunk.com/how-to-guides/agent-control/initialize-and-configure-agent-control
 
         agent = factory.create_agent(
             domain=DOMAIN,
@@ -225,22 +222,15 @@ def get_or_create_session(session_id: str) -> ChatSession:
 
 
 def ensure_sao_session(chat_session: ChatSession) -> None:
-    """Prepare the named session for this browser visit.
+    """Do not start a named session here.
 
-    Galileo called start_session here. SAO session is thread-local, so doing
-    that on the FastAPI thread created empty "AI Assistant" next to auto
-    "session". The worker in process_query calls start_session with this
-    name + external_id (SDK reuses by external_id).
+    A custom name created empty "AI Assistant" next to auto "session".
+    process_query starts the default session on the worker (no name).
     """
-    session_name = "AI Assistant"
-    chat_session.agent.sao_session_name = session_name
+    chat_session.agent.sao_session_name = None
     cached = _sao_session_ids.get(chat_session.session_id)
     if cached:
         chat_session.sao_session_id = cached
-    print(
-        f"[api] sao session will start on worker "
-        f"name={session_name!r} external_id={chat_session.session_id}"
-    )
 
 
 # --------------------------------------------------

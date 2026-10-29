@@ -659,15 +659,20 @@ _sao_session_lock = threading.Lock()
 def start_demo_session(
     sao_logger,
     *,
-    name: str,
+    name: Optional[str] = None,
     external_id: str,
     metadata: Optional[dict] = None,
 ) -> Optional[str]:
-    """Start or reuse a named SAO session (SDK reuses by external_id)."""
+    """Start or reuse a session (SDK reuses by external_id). Name is omitted so
+    the server keeps the default "session" instead of a second empty name.
+    https://agent-observability-docs.splunk.com/sdk-api/python/reference/logger/logger
+    """
     if sao_logger is None:
         return None
     meta = string_metadata(metadata)
-    kwargs = {"name": name, "external_id": external_id}
+    kwargs = {"external_id": external_id}
+    if name:
+        kwargs["name"] = name
     if meta:
         kwargs["metadata"] = meta
     session_id = sao_logger.start_session(**kwargs)
@@ -692,19 +697,16 @@ def _persist_logger_ids(sao_logger) -> None:
 def ensure_logger_session(
     sao_logger,
     *,
-    name: str,
+    name: Optional[str] = None,
     external_id: str,
     metadata: Optional[dict] = None,
 ) -> Optional[str]:
-    """Start or reuse the named session on the current thread.
+    """Attach the default SAO session on the current thread.
 
-    Galileo stored the session on the logger object, so api.py could
-    start_session on the FastAPI thread. SAO session is thread-local, so this
-    must run on the same thread as start_trace / ainvoke. Using external_id
-    reuses the existing session instead of creating a second one named
-    "session".
+    Do not pass a custom name — that created empty "AI Assistant" next to
+    auto "session". Omit name so the server keeps "session". external_id
+    reuses one session per browser tab.
     https://agent-observability-docs.splunk.com/concepts/logging/sessions/using-sessions
-    https://agent-observability-docs.splunk.com/sdk-api/python/reference/logger/logger
     """
     if sao_logger is None or not external_id:
         print(f"[sao] ensure_logger_session skipped logger={sao_logger} external_id={external_id!r}")

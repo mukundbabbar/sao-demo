@@ -49,6 +49,7 @@ from helpers.agent_control_helpers import (
     extract_steering_instructions,
     build_steer_correction_prompt,
 )
+from helpers.sao_otel import isolate_http_parent, restore_otel_context
 
 # Streamlit import (optional - for UI integration)
 try:
@@ -245,7 +246,7 @@ class LangGraphAgent(BaseAgent):
         self.model_override = model_override
         self.sao_logger = sao_logger
         self.llm_provider = llm_provider if llm_provider in ("local", "hosted", "bedrock") else "local"
-        self.sao_session_name = "AI Assistant"
+        self.sao_session_name = None
         self.sao_session_id = None
 
         # Same as Galileo: bind the per-session logger once. start_new_trace=False
@@ -526,21 +527,21 @@ class LangGraphAgent(BaseAgent):
         """Process a user query asynchronously (required for @control async nodes)."""
         provider_token = set_llm_provider(self.llm_provider)
         response = "No response generated"
+        http_token = isolate_http_parent()
         try:
-            # SAO session is thread-local (Galileo stored it on the logger).
-            # Start/reuse it here — the FastAPI thread's start_session is empty.
-            # https://agent-observability-docs.splunk.com/how-to-guides/agent-control/initialize-and-configure-agent-control
+            # No custom session name. A name created empty "AI Assistant" next
+            # to auto "session". Detach POST /query so this trace is complete
+            # rather than Partial, and the session view lists the interactions.
             if self.sao_logger:
                 sao_id = ensure_logger_session(
                     self.sao_logger,
-                    name=getattr(self, "sao_session_name", None) or "AI Assistant",
+                    name=None,
                     external_id=self.session_id,
                     metadata=metadata,
                 )
                 self.sao_session_id = sao_id
                 print(
                     f"[sao] worker session sao_id={sao_id} "
-                    f"name={getattr(self, 'sao_session_name', None)!r} "
                     f"external_id={self.session_id!r} "
                     f"project_id={getattr(self.sao_logger, 'project_id', None)!r} "
                     f"agent_stream_id={getattr(self.sao_logger, 'agent_stream_id', None)!r}"
@@ -579,6 +580,7 @@ class LangGraphAgent(BaseAgent):
                 response = message_content_to_text(result["messages"][-1].content)
             return response
         finally:
+            restore_otel_context(http_token)
             reset_llm_provider(provider_token)
             if self.sao_logger:
                 finalize_trace(self.sao_logger, response)
