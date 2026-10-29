@@ -489,7 +489,9 @@ class LangGraphAgent(BaseAgent):
 
         return graph_builder.compile()
     
-    async def _process_query_async(self, messages: List[Dict[str, str]]) -> str:
+    async def _process_query_async(
+        self, messages: List[Dict[str, str]], metadata: Optional[dict] = None
+    ) -> str:
         """Process a user query asynchronously (required for @control async nodes)."""
         provider_token = set_llm_provider(self.llm_provider)
         otel_token = isolate_agent_trace_context()
@@ -513,6 +515,7 @@ class LangGraphAgent(BaseAgent):
                 self.sao_logger,
                 langchain_messages,
                 trace_name="Run Agent",
+                metadata=metadata,
             )
 
             result = await self.graph.ainvoke(initial_state, self.config)
@@ -527,10 +530,12 @@ class LangGraphAgent(BaseAgent):
             restore_agent_trace_context(otel_token)
             reset_llm_provider(provider_token)
 
-    def process_query(self, messages: List[Dict[str, str]]) -> str:
+    def process_query(
+        self, messages: List[Dict[str, str]], metadata: Optional[dict] = None
+    ) -> str:
         """Process a user query and return a response"""
         try:
-            return _run_async(self._process_query_async(messages))
+            return _run_async(self._process_query_async(messages, metadata=metadata))
         except ControlViolationError as e:
             return format_blocked_message(e, step_name="Bank Assistant")
         except ControlSteerError as e:

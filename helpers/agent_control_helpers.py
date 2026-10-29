@@ -131,19 +131,16 @@ def restore_agent_trace_context(token) -> None:
     otel_context.detach(token)
 
 
-def apply_correlation_attrs(sao_logger, attrs: Optional[dict] = None) -> None:
-    """Copy Galileo-style session/project ids onto the active SAO root span."""
-    attrs = attrs or getattr(sao_logger, "correlation_attrs", None)
-    if not attrs:
-        return
-    from opentelemetry import trace
-
-    span = trace.get_current_span()
-    if not span or not span.is_recording():
-        return
-    for key, value in attrs.items():
-        if value is not None:
-            span.set_attribute(key, value)
+def string_metadata(raw: Optional[dict] = None) -> dict:
+    """Flat string metadata for start_session / start_trace (SDK requires str keys/values)."""
+    if not raw:
+        return {}
+    metadata = {}
+    for key, value in raw.items():
+        if value is None or value == "":
+            continue
+        metadata[str(key)[:256]] = str(value)[:256]
+    return metadata
 
 
 def ensure_trace_started(
@@ -152,21 +149,18 @@ def ensure_trace_started(
     *,
     trace_input: Optional[str] = None,
     trace_name: str = "Run Agent",
+    metadata: Optional[dict] = None,
 ) -> None:
     """Start a Splunk AO trace when none is active (required before add_llm_span)."""
     if not sao_logger or sao_logger.current_parent() is not None:
         return
     if trace_input is None and messages is not None:
         trace_input = _extract_trace_input(messages)
-    metadata = getattr(sao_logger, "correlation_attrs", None) or None
+    meta = string_metadata(metadata)
     kwargs = {"input": trace_input or "", "name": trace_name}
-    if metadata:
-        kwargs["metadata"] = metadata
-    try:
-        sao_logger.start_trace(**kwargs)
-    except TypeError:
-        sao_logger.start_trace(input=trace_input or "", name=trace_name)
-    apply_correlation_attrs(sao_logger, metadata)
+    if meta:
+        kwargs["metadata"] = meta
+    sao_logger.start_trace(**kwargs)
 
 
 def finalize_trace(sao_logger, output: str) -> None:

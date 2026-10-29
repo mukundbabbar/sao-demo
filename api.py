@@ -35,7 +35,7 @@ from helpers.sao_api_helpers import (
     get_sao_app_url,
     create_sao_logger,
 )
-from helpers.agent_control_helpers import init_agent_control
+from helpers.agent_control_helpers import init_agent_control, string_metadata
 
 from agent_factory import AgentFactory
 
@@ -204,9 +204,20 @@ def ensure_sao_session(chat_session: ChatSession) -> None:
         )
         return
 
+    session_metadata = string_metadata(
+        {
+            "splunk_ao.project_id": project_id,
+            "splunk_ao.agent_stream_id": agent_stream_id,
+            "splunk_ao.session_id": external_id,
+            "splunk_ao.url": (
+                f"{console_url}/project/{project_id}/agent-streams/{agent_stream_id}"
+            ),
+        }
+    )
     sao_id = logger.start_session(
         name=session_name,
         external_id=external_id,
+        metadata=session_metadata or None,
     )
     if not sao_id:
         sao_id = getattr(logger, "session_id", None)
@@ -240,17 +251,18 @@ async def query(request_body: QueryRequest, request: Request):
     sao_id = chat_session.sao_session_id or getattr(
         chat_session.logger, "session_id", None
     )
-    correlation_attrs = {
-        "splunk_ao.project_id": project_id,
-        "splunk_ao.agent_stream_id": agent_stream_id,
-        "splunk_ao.session_id": session_id,
-        "splunk_ao_user_session_id": sao_id,
-        "splunk_ao.url": (
-            f"{console_url}/project/{project_id}/agent-streams/{agent_stream_id}"
-        ),
-    }
-    chat_session.logger.correlation_attrs = correlation_attrs
-    request.state.otel_sao_attrs = correlation_attrs
+    trace_metadata = string_metadata(
+        {
+            "splunk_ao.project_id": project_id,
+            "splunk_ao.agent_stream_id": agent_stream_id,
+            "splunk_ao.session_id": session_id,
+            "splunk_ao_user_session_id": sao_id,
+            "splunk_ao.url": (
+                f"{console_url}/project/{project_id}/agent-streams/{agent_stream_id}"
+            ),
+        }
+    )
+    request.state.otel_sao_attrs = trace_metadata
 
     chat_session.messages.append(
         {"role": "user", "content": request_body.question}
@@ -259,6 +271,7 @@ async def query(request_body: QueryRequest, request: Request):
     response = await asyncio.to_thread(
         chat_session.agent.process_query,
         chat_session.messages,
+        metadata=trace_metadata,
     )
 
     chat_session.messages.append(
