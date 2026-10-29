@@ -118,9 +118,20 @@ def _correlation_metadata(session_id: str, logger=None, sao_id: Optional[str] = 
 # FastAPI
 # --------------------------------------------------
 
-app = FastAPI(
-    title="Bank AI Assistant API"
-)
+# FastAPI 0.128+ records POST /query + fastapi.endpoint as the OTel parent.
+# That turns the agent tree into a Partial HTTP trace. Galileo had no HTTP root.
+# https://fastapi.tiangolo.com/advanced/opentelemetry/
+try:
+    app = FastAPI(
+        title="Bank AI Assistant API",
+        telemetry={
+            "tracing": False,
+            "operation_spans": False,
+            "auto_configure": False,
+        },
+    )
+except TypeError:
+    app = FastAPI(title="Bank AI Assistant API")
 
 
 class EndOtelTraceMiddleware(BaseHTTPMiddleware):
@@ -221,7 +232,7 @@ async def query(request_body: QueryRequest, request: Request):
     print(f"[api] /query received session_id={session_id!r} question={request_body.question!r}")
 
     chat_session = get_or_create_session(session_id)
-    session_name = f"{DOMAIN.title()} Agent Demo"
+    session_name = "AI Assistant"
     ensure_logger_session(
         chat_session.logger,
         name=session_name,

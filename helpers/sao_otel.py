@@ -1,9 +1,9 @@
-"""Splunk AO OpenTelemetry provider and remote-client instrumentors.
+"""SAO OpenTelemetry provider for span attributes only.
 
-SAO's logger.start_trace does not set an OpenTelemetry current span, so
-get_current_span() is not recording and Bedrock/Postgres calls never
-appear as CLIENT spans. Docs: attach SplunkAOSpanProcessor, then
-OpenInference LLM instrumentors (not opentelemetry-instrument uvicorn).
+Do not instrument FastAPI, SQL, or HTTP clients. Those create POST /query,
+select/show, and extra POST leaves and parent the agent tree under a Partial
+HTTP trace. Galileo structure is session → Run Agent → LangChain spans from
+the SAO SDK callback.
 
 https://agent-observability-docs.splunk.com/how-to-guides/third-party-integrations/otel
 """
@@ -11,24 +11,32 @@ from __future__ import annotations
 
 import os
 
+from opentelemetry import context as otel_context
+from opentelemetry import trace as otel_trace
+
 _initialized = False
 
 
-def _try_instrument(label: str, fn) -> None:
+def isolate_http_parent():
+    """Detach from FastAPI POST /query so Run Agent is its own root."""
+    return otel_context.attach(otel_trace.set_span_in_context(otel_trace.INVALID_SPAN))
+
+
+def restore_otel_context(token) -> None:
+    if token is None:
+        return
     try:
-        fn()
-        print(f"[otel] {label} instrumented")
-    except Exception as exc:
-        print(f"[otel] {label} skipped: {exc}")
+        otel_context.detach(token)
+    except Exception:
+        pass
 
 
 def init_sao_otel() -> None:
-    """Install SAO's TracerProvider and instrument LLM + vector-DB clients once."""
+    """Install SAO's TracerProvider so attributes can be stamped on agent spans."""
     global _initialized
     if _initialized:
         return
 
-    from opentelemetry import trace as trace_api
     from opentelemetry.sdk import trace as trace_sdk
     from opentelemetry.sdk.resources import Resource
 
@@ -69,42 +77,10 @@ def init_sao_otel() -> None:
         print(f"[otel] add_splunk_ao_span_processor failed, using add_span_processor: {exc}")
         tracer_provider.add_span_processor(splunk_ao_span_processor)
 
-    trace_api.set_tracer_provider(tracer_provider)
+    otel_trace.set_tracer_provider(tracer_provider)
     register_correlation_processor()
-
-    def _bedrock():
-        from openinference.instrumentation.bedrock import BedrockInstrumentor
-
-        BedrockInstrumentor().instrument(tracer_provider=tracer_provider)
-
-    def _openai():
-        from openinference.instrumentation.openai import OpenAIInstrumentor
-
-        OpenAIInstrumentor().instrument(tracer_provider=tracer_provider)
-
-    def _sqlalchemy():
-        from opentelemetry.instrumentation.sqlalchemy import SQLAlchemyInstrumentor
-
-        SQLAlchemyInstrumentor().instrument(tracer_provider=tracer_provider)
-
-    def _psycopg():
-        from opentelemetry.instrumentation.psycopg import PsycopgInstrumentor
-
-        PsycopgInstrumentor().instrument(tracer_provider=tracer_provider)
-
-    def _httpx():
-        from opentelemetry.instrumentation.httpx import HTTPXClientInstrumentor
-
-        HTTPXClientInstrumentor().instrument(tracer_provider=tracer_provider)
-
-    _try_instrument("Bedrock (LLM + embeddings)", _bedrock)
-    _try_instrument("OpenAI", _openai)
-    _try_instrument("SQLAlchemy (pgvector + SQL tools)", _sqlalchemy)
-    _try_instrument("psycopg", _psycopg)
-    _try_instrument("httpx (Ollama)", _httpx)
-
     _initialized = True
     print(
-        f"[otel] SAO TracerProvider ready project={project!r} "
-        f"agent_stream={agent_stream!r}"
+        f"[otel] SAO TracerProvider ready (attributes only) "
+        f"project={project!r} agent_stream={agent_stream!r}"
     )

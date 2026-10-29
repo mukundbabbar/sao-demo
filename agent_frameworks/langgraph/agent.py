@@ -34,6 +34,7 @@ try:
     from splunk_ao.handlers.langchain import SplunkAOAsyncCallback
 except ImportError:
     SplunkAOAsyncCallback = SplunkAOCallback
+from helpers.sao_otel import isolate_http_parent, restore_otel_context
 from helpers.agent_control_helpers import (
     attach_control_bridge,
     ensure_logger_session,
@@ -552,9 +553,10 @@ class LangGraphAgent(BaseAgent):
         """Process a user query asynchronously (required for @control async nodes)."""
         provider_token = set_llm_provider(self.llm_provider)
         response = "No response generated"
-        session_name = f"{self.domain_config.name.title()} Agent Demo"
+        session_name = "AI Assistant"
         logger = self.sao_logger
         corr_token = None
+        http_token = isolate_http_parent()
         try:
             # Same logger the callback was built with. Do not open
             # splunk_ao_context — that created a second empty "Bank Agent Demo".
@@ -594,22 +596,13 @@ class LangGraphAgent(BaseAgent):
             self.config = self._callback_config(logger, otel_attrs=metadata)
             attach_control_bridge(logger)
 
-            # logger.start_trace is not an OTel current span (console:
-            # "skip stamp ... no recording span"). Client instrumentors
-            # (Bedrock, Postgres) only nest when a recording span is current.
-            async def _ainvoke():
-                return await self.graph.ainvoke(initial_state, self.config)
-
-            current = otel_trace.get_current_span()
-            if current is not None and current.is_recording():
-                stamp_otel_attributes(metadata, where="current", span=current)
-                result = await _ainvoke()
-            else:
-                with otel_trace.get_tracer("sao-demo").start_as_current_span(
-                    "Run Agent"
-                ) as run_span:
-                    stamp_otel_attributes(metadata, where="Run Agent", span=run_span)
-                    result = await _ainvoke()
+            # Always start Run Agent as a root. If POST /query is current,
+            # LangChain/SQL/HTTP spans nest under it and SAO shows Partial.
+            with otel_trace.get_tracer("sao-demo").start_as_current_span(
+                "Run Agent"
+            ) as run_span:
+                stamp_otel_attributes(metadata, where="Run Agent", span=run_span)
+                result = await self.graph.ainvoke(initial_state, self.config)
             if result["messages"]:
                 response = message_content_to_text(result["messages"][-1].content)
             return response
@@ -617,6 +610,7 @@ class LangGraphAgent(BaseAgent):
             if logger:
                 finalize_trace(logger, response)
             reset_correlation_attrs(corr_token)
+            restore_otel_context(http_token)
             reset_llm_provider(provider_token)
 
     async def process_query_async(
