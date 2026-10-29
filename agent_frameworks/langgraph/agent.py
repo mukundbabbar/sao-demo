@@ -33,6 +33,8 @@ try:
 except ImportError:
     SplunkAOAsyncCallback = SplunkAOCallback
 from helpers.agent_control_helpers import (
+    attach_control_bridge,
+    ensure_logger_session,
     ensure_trace_started,
     finalize_trace,
     format_blocked_message,
@@ -243,7 +245,9 @@ class LangGraphAgent(BaseAgent):
         self.model_override = model_override
         self.sao_logger = sao_logger
         self.llm_provider = llm_provider if llm_provider in ("local", "hosted", "bedrock") else "local"
-        
+        self.sao_session_name = "AI Assistant"
+        self.sao_session_id = None
+
         # Same as Galileo: bind the per-session logger once. start_new_trace=False
         # attaches LangGraph spans to logger.start_trace("Run Agent").
         self.config = {
@@ -523,11 +527,32 @@ class LangGraphAgent(BaseAgent):
         provider_token = set_llm_provider(self.llm_provider)
         response = "No response generated"
         try:
-            # SAO set_session is ambient (Galileo stored it on the logger).
-            # Re-attach on this worker; do not start_session again.
-            sao_id = getattr(self.sao_logger, "session_id", None) if self.sao_logger else None
-            if self.sao_logger and sao_id:
-                self.sao_logger.set_session(sao_id)
+            # SAO session is thread-local (Galileo stored it on the logger).
+            # Start/reuse it here — the FastAPI thread's start_session is empty.
+            # https://agent-observability-docs.splunk.com/how-to-guides/agent-control/initialize-and-configure-agent-control
+            if self.sao_logger:
+                sao_id = ensure_logger_session(
+                    self.sao_logger,
+                    name=getattr(self, "sao_session_name", None) or "AI Assistant",
+                    external_id=self.session_id,
+                    metadata=metadata,
+                )
+                self.sao_session_id = sao_id
+                print(
+                    f"[sao] worker session sao_id={sao_id} "
+                    f"name={getattr(self, 'sao_session_name', None)!r} "
+                    f"external_id={self.session_id!r} "
+                    f"project_id={getattr(self.sao_logger, 'project_id', None)!r} "
+                    f"agent_stream_id={getattr(self.sao_logger, 'agent_stream_id', None)!r}"
+                )
+                self.sao_logger.enable_agent_control()
+                project_name, agent_stream = self._sao_project_stream()
+                init_agent_control(
+                    self.sao_logger,
+                    project_name=project_name,
+                    agent_stream=agent_stream,
+                    agent_description=f"{self.domain_config.name.title()} demo agent",
+                )
 
             if not self.tools:
                 self.load_tools()
@@ -548,6 +573,7 @@ class LangGraphAgent(BaseAgent):
                 trace_name="Run Agent",
                 metadata=metadata,
             )
+            attach_control_bridge(self.sao_logger)
             result = await self.graph.ainvoke(initial_state, self.config)
             if result["messages"]:
                 response = message_content_to_text(result["messages"][-1].content)

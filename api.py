@@ -36,7 +36,6 @@ from helpers.sao_api_helpers import (
     create_sao_logger,
 )
 from helpers.agent_control_helpers import (
-    init_agent_control,
     string_metadata,
 )
 from helpers.sao_otel import init_sao_otel
@@ -98,7 +97,7 @@ def _correlation_metadata(session_id: str, logger=None, sao_id: Optional[str] = 
     """IDs for start_session / start_trace. Prefer live logger values over import-time lookup."""
     resolved_project_id = (
         getattr(logger, "project_id", None) if logger is not None else None
-    ) or project_id
+    ) or project_id or os.environ.get("SPLUNK_AO_PROJECT_ID")
     resolved_stream_id = (
         (
             getattr(logger, "agent_stream_id", None)
@@ -106,7 +105,7 @@ def _correlation_metadata(session_id: str, logger=None, sao_id: Optional[str] = 
         )
         if logger is not None
         else None
-    ) or agent_stream_id
+    ) or agent_stream_id or os.environ.get("SPLUNK_AO_AGENT_STREAM_ID")
     return {
         "splunk_ao.project_id": resolved_project_id,
         "splunk_ao.agent_stream_id": resolved_stream_id,
@@ -203,12 +202,9 @@ def get_or_create_session(session_id: str) -> ChatSession:
             agent_stream=agent_stream_name,
         )
         logger.enable_agent_control()
-        init_agent_control(
-            logger,
-            project_name=project_name,
-            agent_stream=agent_stream_name,
-            agent_description=f"{DOMAIN.title()} demo agent",
-        )
+        # Agent Control needs logger.agent_stream_id, which SAO only sets after
+        # start_session. That call happens on the worker in process_query.
+        # https://agent-observability-docs.splunk.com/how-to-guides/agent-control/initialize-and-configure-agent-control
 
         agent = factory.create_agent(
             domain=DOMAIN,
@@ -229,46 +225,22 @@ def get_or_create_session(session_id: str) -> ChatSession:
 
 
 def ensure_sao_session(chat_session: ChatSession) -> None:
-    """Attach the logger to the SAO session for this browser visit.
+    """Prepare the named session for this browser visit.
 
-    Same flow as Galileo ensure_galileo_session: one named session per tab,
-    reused by external_id. The callback is bound to this logger at agent init.
+    Galileo called start_session here. SAO session is thread-local, so doing
+    that on the FastAPI thread created empty "AI Assistant" next to auto
+    "session". The worker in process_query calls start_session with this
+    name + external_id (SDK reuses by external_id).
     """
-    external_id = chat_session.session_id
     session_name = "AI Assistant"
-    logger = chat_session.logger
-
-    cached_sao_id = _sao_session_ids.get(external_id)
-    if cached_sao_id:
-        logger.set_session(cached_sao_id)
-        chat_session.sao_session_id = cached_sao_id
-        print(
-            f"[api] sao set_session sao_id={cached_sao_id} "
-            f"external_id={external_id}"
-        )
-        return
-
-    sao_id = logger.start_session(
-        name=session_name,
-        external_id=external_id,
+    chat_session.agent.sao_session_name = session_name
+    cached = _sao_session_ids.get(chat_session.session_id)
+    if cached:
+        chat_session.sao_session_id = cached
+    print(
+        f"[api] sao session will start on worker "
+        f"name={session_name!r} external_id={chat_session.session_id}"
     )
-    if not sao_id:
-        sao_id = getattr(logger, "session_id", None)
-
-    if sao_id:
-        _sao_session_ids[external_id] = sao_id
-        chat_session.sao_session_id = sao_id
-        print(
-            f"[api] sao start_session sao_id={sao_id} "
-            f"external_id={external_id} "
-            f"project_id={getattr(logger, 'project_id', None)!r} "
-            f"agent_stream_id={getattr(logger, 'agent_stream_id', None)!r}"
-        )
-    else:
-        print(
-            f"[api] WARNING: no SAO session for external_id={external_id}; "
-            "traces will each get their own auto-generated session"
-        )
 
 
 # --------------------------------------------------
@@ -287,6 +259,27 @@ async def query(request_body: QueryRequest, request: Request):
         {"role": "user", "content": request_body.question}
     )
 
+    # Galileo ran process_query off the request thread so the HTTP span is
+    # not the agent parent. SAO start_session also happens inside process_query
+    # (session is thread-local; starting it here left AI Assistant empty).
+    response = await asyncio.to_thread(
+        chat_session.agent.process_query,
+        chat_session.messages,
+        string_metadata(
+            _correlation_metadata(
+                session_id,
+                chat_session.logger,
+                sao_id=chat_session.sao_session_id,
+            )
+        ),
+    )
+
+    chat_session.sao_session_id = getattr(
+        chat_session.agent, "sao_session_id", None
+    ) or chat_session.sao_session_id
+    if chat_session.sao_session_id:
+        _sao_session_ids[session_id] = chat_session.sao_session_id
+
     trace_metadata = string_metadata(
         _correlation_metadata(
             session_id,
@@ -296,18 +289,6 @@ async def query(request_body: QueryRequest, request: Request):
     )
     request.state.otel_sao_attrs = trace_metadata
     print(f"[api] /query correlation metadata={trace_metadata}")
-
-    # Galileo ran process_query off the request thread so the HTTP span is
-    # not the agent parent. SAO set_session is re-attached inside process_query.
-    response = await asyncio.to_thread(
-        chat_session.agent.process_query,
-        chat_session.messages,
-        trace_metadata,
-    )
-
-    chat_session.sao_session_id = getattr(
-        chat_session.logger, "session_id", None
-    ) or chat_session.sao_session_id
     chat_session.messages.append(
         {"role": "assistant", "content": response}
     )
@@ -316,11 +297,12 @@ async def query(request_body: QueryRequest, request: Request):
         "answer": response,
         "session_id": session_id,
         "splunk_ao": {
-            "project_id": project_id,
-            "agent_stream_id": agent_stream_id,
+            "project_id": project_id or os.environ.get("SPLUNK_AO_PROJECT_ID"),
+            "agent_stream_id": agent_stream_id or os.environ.get("SPLUNK_AO_AGENT_STREAM_ID"),
             "url": (
                 f"{console_url}/project/"
-                f"{project_id}/agent-streams/{agent_stream_id}"
+                f"{project_id or os.environ.get('SPLUNK_AO_PROJECT_ID')}/agent-streams/"
+                f"{agent_stream_id or os.environ.get('SPLUNK_AO_AGENT_STREAM_ID')}"
             )
         }
     }

@@ -674,6 +674,21 @@ def start_demo_session(
     return session_id or getattr(sao_logger, "session_id", None)
 
 
+def _persist_logger_ids(sao_logger) -> None:
+    """Cache resolved project/stream UUIDs for Agent Control on later threads."""
+    if sao_logger is None:
+        return
+    project_id = getattr(sao_logger, "project_id", None)
+    stream_id = (
+        getattr(sao_logger, "agent_stream_id", None)
+        or getattr(sao_logger, "log_stream_id", None)
+    )
+    if project_id:
+        os.environ["SPLUNK_AO_PROJECT_ID"] = str(project_id)
+    if stream_id:
+        os.environ["SPLUNK_AO_AGENT_STREAM_ID"] = str(stream_id)
+
+
 def ensure_logger_session(
     sao_logger,
     *,
@@ -681,22 +696,19 @@ def ensure_logger_session(
     external_id: str,
     metadata: Optional[dict] = None,
 ) -> Optional[str]:
-    """Attach this browser visit's session on the current thread, then start traces.
+    """Start or reuse the named session on the current thread.
 
-    Galileo kept the session on the logger instance. SAO set_session is ambient
-    for the current thread/async context, and /query runs process_query in a
-    worker thread — so this must run on that same thread as start_trace.
+    Galileo stored the session on the logger object, so api.py could
+    start_session on the FastAPI thread. SAO session is thread-local, so this
+    must run on the same thread as start_trace / ainvoke. Using external_id
+    reuses the existing session instead of creating a second one named
+    "session".
+    https://agent-observability-docs.splunk.com/concepts/logging/sessions/using-sessions
     https://agent-observability-docs.splunk.com/sdk-api/python/reference/logger/logger
     """
     if sao_logger is None or not external_id:
         print(f"[sao] ensure_logger_session skipped logger={sao_logger} external_id={external_id!r}")
         return None
-    with _sao_session_lock:
-        cached = _sao_session_ids.get(external_id)
-    if cached:
-        sao_logger.set_session(cached)
-        debug_sao(f"set_session cached name={name!r} external_id={external_id!r}", sao_logger, metadata)
-        return cached
     session_meta = logger_id_metadata(sao_logger, metadata)
     debug_sao(f"start_session name={name!r} external_id={external_id!r}", sao_logger, session_meta)
     session_id = start_demo_session(
@@ -708,7 +720,7 @@ def ensure_logger_session(
     if session_id:
         with _sao_session_lock:
             _sao_session_ids[external_id] = session_id
-        sao_logger.set_session(session_id)
+        _persist_logger_ids(sao_logger)
     debug_sao(f"start_session result sao_id={session_id!r}", sao_logger, session_meta)
     return session_id
 
