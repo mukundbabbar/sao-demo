@@ -36,7 +36,6 @@ from helpers.sao_api_helpers import (
     create_sao_logger,
 )
 from helpers.agent_control_helpers import (
-    ensure_logger_session,
     init_agent_control,
     string_metadata,
 )
@@ -88,6 +87,11 @@ agent_stream_id = get_sao_agent_stream_id(
 
 print("SPLUNK AO PROJECT ID:", project_id)
 print("SPLUNK AO AGENT STREAM ID:", agent_stream_id)
+
+if project_id:
+    os.environ["SPLUNK_AO_PROJECT_ID"] = str(project_id)
+if agent_stream_id:
+    os.environ["SPLUNK_AO_AGENT_STREAM_ID"] = str(agent_stream_id)
 
 
 def _correlation_metadata(session_id: str, logger=None, sao_id: Optional[str] = None) -> dict:
@@ -182,6 +186,8 @@ class ChatSession:
 
 factory = AgentFactory()
 sessions: Dict[str, ChatSession] = {}
+# browser session_id -> SAO internal session UUID (same cache as Galileo)
+_sao_session_ids: Dict[str, str] = {}
 _sessions_lock = threading.Lock()
 
 
@@ -195,14 +201,6 @@ def get_or_create_session(session_id: str) -> ChatSession:
         logger = create_sao_logger(
             project_name=project_name,
             agent_stream=agent_stream_name,
-        )
-        # Agent Control needs logger.agent_stream_id, which the SDK sets on
-        # start_session. Use the same logger the LangChain callback will get.
-        ensure_logger_session(
-            logger,
-            name="AI Assistant",
-            external_id=session_id,
-            metadata=_correlation_metadata(session_id, logger),
         )
         logger.enable_agent_control()
         init_agent_control(
@@ -230,6 +228,49 @@ def get_or_create_session(session_id: str) -> ChatSession:
         return chat_session
 
 
+def ensure_sao_session(chat_session: ChatSession) -> None:
+    """Attach the logger to the SAO session for this browser visit.
+
+    Same flow as Galileo ensure_galileo_session: one named session per tab,
+    reused by external_id. The callback is bound to this logger at agent init.
+    """
+    external_id = chat_session.session_id
+    session_name = "AI Assistant"
+    logger = chat_session.logger
+
+    cached_sao_id = _sao_session_ids.get(external_id)
+    if cached_sao_id:
+        logger.set_session(cached_sao_id)
+        chat_session.sao_session_id = cached_sao_id
+        print(
+            f"[api] sao set_session sao_id={cached_sao_id} "
+            f"external_id={external_id}"
+        )
+        return
+
+    sao_id = logger.start_session(
+        name=session_name,
+        external_id=external_id,
+    )
+    if not sao_id:
+        sao_id = getattr(logger, "session_id", None)
+
+    if sao_id:
+        _sao_session_ids[external_id] = sao_id
+        chat_session.sao_session_id = sao_id
+        print(
+            f"[api] sao start_session sao_id={sao_id} "
+            f"external_id={external_id} "
+            f"project_id={getattr(logger, 'project_id', None)!r} "
+            f"agent_stream_id={getattr(logger, 'agent_stream_id', None)!r}"
+        )
+    else:
+        print(
+            f"[api] WARNING: no SAO session for external_id={external_id}; "
+            "traces will each get their own auto-generated session"
+        )
+
+
 # --------------------------------------------------
 # API endpoint
 # --------------------------------------------------
@@ -240,19 +281,11 @@ async def query(request_body: QueryRequest, request: Request):
     print(f"[api] /query received session_id={session_id!r} question={request_body.question!r}")
 
     chat_session = get_or_create_session(session_id)
-    ensure_logger_session(
-        chat_session.logger,
-        name="AI Assistant",
-        external_id=session_id,
-        metadata=_correlation_metadata(
-            session_id,
-            chat_session.logger,
-            sao_id=chat_session.sao_session_id,
-        ),
+    ensure_sao_session(chat_session)
+
+    chat_session.messages.append(
+        {"role": "user", "content": request_body.question}
     )
-    chat_session.sao_session_id = getattr(
-        chat_session.logger, "session_id", None
-    ) or chat_session.sao_session_id
 
     trace_metadata = string_metadata(
         _correlation_metadata(
@@ -261,24 +294,17 @@ async def query(request_body: QueryRequest, request: Request):
             sao_id=chat_session.sao_session_id,
         )
     )
-    print(f"[api] /query correlation metadata={trace_metadata}")
-    print(
-        f"[api] /query logger ids project_id={getattr(chat_session.logger, 'project_id', None)!r} "
-        f"agent_stream_id={getattr(chat_session.logger, 'agent_stream_id', None)!r} "
-        f"session_id={getattr(chat_session.logger, 'session_id', None)!r}"
-    )
     request.state.otel_sao_attrs = trace_metadata
+    print(f"[api] /query correlation metadata={trace_metadata}")
 
-    chat_session.messages.append(
-        {"role": "user", "content": request_body.question}
-    )
-
-    response = await chat_session.agent.process_query_async(
+    # Galileo ran process_query off the request thread so the HTTP span is
+    # not the agent parent. SAO set_session is re-attached inside process_query.
+    response = await asyncio.to_thread(
+        chat_session.agent.process_query,
         chat_session.messages,
-        metadata=trace_metadata,
+        trace_metadata,
     )
 
-    chat_session.logger = chat_session.agent.sao_logger or chat_session.logger
     chat_session.sao_session_id = getattr(
         chat_session.logger, "session_id", None
     ) or chat_session.sao_session_id

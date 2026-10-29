@@ -739,9 +739,11 @@ def _resolve_agent_stream_id(sao_logger) -> Optional[str]:
     https://agent-observability-docs.splunk.com/how-to-guides/agent-control/initialize-and-configure-agent-control
     """
     if sao_logger is None:
-        return None
-    return getattr(sao_logger, "agent_stream_id", None) or getattr(
-        sao_logger, "log_stream_id", None
+        return os.environ.get("SPLUNK_AO_AGENT_STREAM_ID")
+    return (
+        getattr(sao_logger, "agent_stream_id", None)
+        or getattr(sao_logger, "log_stream_id", None)
+        or os.environ.get("SPLUNK_AO_AGENT_STREAM_ID")
     )
 
 
@@ -814,11 +816,7 @@ def init_agent_control(
         server_url=server_url,
         api_key=api_key,
         api_key_header=api_key_header,
-        # False: @control still evaluates, but does not create an OTel parent
-        # named after the control (PII_...). Galileo traces were not OTel, so
-        # that parent never appeared there. Control leaves still come from
-        # logger.enable_agent_control() after start_trace.
-        observability_enabled=False,
+        observability_enabled=True,
         observability_sink_name="registered",
         target_type=target_type,
         target_id=target_id,
