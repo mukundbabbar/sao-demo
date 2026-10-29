@@ -26,8 +26,8 @@ COPY . .
 
 RUN chmod +x docker-entrypoint.sh
 
-# Streamlit UI (override for API: uvicorn api:app --host 0.0.0.0 --port 8080)
-EXPOSE 8501 8080
+# Streamlit UI. Run the banking API on the host with: python start_api.py
+EXPOSE 8501
 
 ENTRYPOINT ["./docker-entrypoint.sh"]
 CMD ["streamlit", "run", "app.py", "--server.port=8501", "--server.address=0.0.0.0", "--server.headless=true"]

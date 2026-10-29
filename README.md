@@ -16,7 +16,7 @@ Not a production reference architecture or replacement for customer-specific POC
 
 ### Prerequisites
 
-- Python 3.8+
+- Python 3.11–3.14 (`splunk-ao` is not published for 3.9/3.10; 3.12 is recommended)
 - Access to a Large Language Model (any one is enough)
    - [Ollama](https://ollama.com/) running locally (set `ollama_base_url` in `.streamlit/secrets.toml`); or
    - AWS Bedrock (set `bedrock_api_key` in `.streamlit/secrets.toml` — the app loads it as `AWS_BEARER_TOKEN_BEDROCK`); or
@@ -204,6 +204,21 @@ PS: Make sure to run the setup script even if you are upgrading from a previous 
    ```
 
 The app will be available at `http://localhost:8501`
+
+9. **Banking UI API (optional, run on the Ubuntu VM — not Docker)**
+   `api.py` exposes `POST /query` for the banking demo UI. Run it on the host with Python 3.12:
+
+   ```bash
+   python start_api.py
+   ```
+
+   That loads `splunk_ao_realm` / `splunk_ao_o11y_token` from `.streamlit/secrets.toml` and runs:
+
+   ```bash
+   opentelemetry-instrument uvicorn api:app --host 0.0.0.0 --port 8000
+   ```
+
+   Point the banking UI at `http://localhost:8000`. Agent traces go to Splunk Agent Observability; the FastAPI HTTP span goes to Splunk APM with `splunk_ao.*` correlation attributes.
 
 ## Model Selection
 

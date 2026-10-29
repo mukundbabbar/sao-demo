@@ -1,5 +1,12 @@
 """
 SAO Demo AI Assistant REST API
+
+Banking UI posts to POST /query. Start with auto-instrumentation so the FastAPI
+HTTP span is exported to Splunk APM (same pattern as galileo-golden-demo):
+
+    python start_api.py
+    # or:
+    opentelemetry-instrument uvicorn api:app --host 0.0.0.0 --port 8000
 """
 
 import os

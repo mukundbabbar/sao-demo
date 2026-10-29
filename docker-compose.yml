@@ -33,33 +33,5 @@ services:
       postgres:
         condition: service_healthy
 
-  # Banking REST API (same image, different command). Enable with: docker compose --profile api up api
-  api:
-    profiles: ["api"]
-    build: .
-    ports:
-      - "8080:8080"
-    environment:
-      POSTGRES_HOST: postgres
-      POSTGRES_PORT: "5432"
-      POSTGRES_USER: postgres
-      POSTGRES_PASSWORD: mypassword
-      POSTGRES_DB: vectordb
-      WAIT_FOR_POSTGRES: "1"
-    volumes:
-      - ./.streamlit/secrets.toml:/app/.streamlit/secrets.toml:ro
-    depends_on:
-      postgres:
-        condition: service_healthy
-    command:
-      [
-        "uvicorn",
-        "api:app",
-        "--host",
-        "0.0.0.0",
-        "--port",
-        "8080",
-      ]
-
 volumes:
   pgdata:
