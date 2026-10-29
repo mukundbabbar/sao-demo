@@ -28,6 +28,7 @@ from langgraph.prebuilt import ToolNode, tools_condition
 from agent_control import ControlSteerError, ControlViolationError, control
 from base_agent import BaseAgent
 from domain_manager import DomainConfig
+from splunk_ao import splunk_ao_context
 from splunk_ao.handlers.langchain import SplunkAOCallback
 
 try:
@@ -268,13 +269,23 @@ class LangGraphAgent(BaseAgent):
 
     def _callback_config(self, sao_logger, otel_attrs: Optional[dict] = None) -> dict:
         """ainvoke requires the async callback; otherwise traces go to a second logger."""
-        callbacks = [
-            SplunkAOAsyncCallback(
+        # Experiments docs pass the logger as the first positional argument.
+        # splunk_ao_logger= is ignored; the callback then uses the singleton
+        # and auto-creates a session named "session".
+        # https://agent-observability-docs.splunk.com/sdk-api/third-party-integrations/langchain/experiments
+        try:
+            sao_callback = SplunkAOAsyncCallback(
+                sao_logger,
+                start_new_trace=False,
+                flush_on_chain_end=False,
+            )
+        except TypeError:
+            sao_callback = SplunkAOAsyncCallback(
                 splunk_ao_logger=sao_logger,
                 start_new_trace=False,
                 flush_on_chain_end=False,
             )
-        ]
+        callbacks = [sao_callback]
         if otel_attrs:
             callbacks.append(OtelCorrelationCallback(otel_attrs))
         return {
@@ -554,12 +565,13 @@ class LangGraphAgent(BaseAgent):
         provider_token = set_llm_provider(self.llm_provider)
         response = "No response generated"
         session_name = "AI Assistant"
-        logger = self.sao_logger
+        # Callback/AC default to the context singleton. start_session on a
+        # private SplunkAOLogger created the empty "AI Assistant".
+        logger = splunk_ao_context.get_logger_instance() or self.sao_logger
+        self.sao_logger = logger
         corr_token = None
         http_token = isolate_http_parent()
         try:
-            # Same logger the callback was built with. Do not open
-            # splunk_ao_context — that created a second empty "Bank Agent Demo".
             if logger and self.session_id:
                 ensure_logger_session(
                     logger,

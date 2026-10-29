@@ -36,7 +36,6 @@ from helpers.sao_api_helpers import (
     create_sao_logger,
 )
 from helpers.agent_control_helpers import (
-    ensure_logger_session,
     init_agent_control,
     string_metadata,
 )
@@ -232,20 +231,6 @@ async def query(request_body: QueryRequest, request: Request):
     print(f"[api] /query received session_id={session_id!r} question={request_body.question!r}")
 
     chat_session = get_or_create_session(session_id)
-    session_name = "AI Assistant"
-    ensure_logger_session(
-        chat_session.logger,
-        name=session_name,
-        external_id=session_id,
-        metadata=_correlation_metadata(
-            session_id,
-            chat_session.logger,
-            sao_id=chat_session.sao_session_id,
-        ),
-    )
-    chat_session.sao_session_id = getattr(
-        chat_session.logger, "session_id", None
-    ) or chat_session.sao_session_id
 
     trace_metadata = string_metadata(
         _correlation_metadata(
