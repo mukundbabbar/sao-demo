@@ -152,14 +152,20 @@ Not a production reference architecture or replacement for customer-specific POC
    postgres_password = "mypassword"
    postgres_db = "vectordb"
 
-   # Splunk Agent Observability Configuration
-   # Do not mix on-prem and SaaS credentials.
-   splunk_ao_api_key = "..."
-   splunk_ao_console_url = "https://console.example.com"
-   # splunk_ao_api_url = "https://api.example.com"
+   # Splunk Agent Observability — pick on-prem OR SaaS, not both.
+   # https://agent-observability-docs.splunk.com/references/faqs/find-keys
+
+   # On-premises
+   # splunk_ao_api_key = "..."
+   # splunk_ao_console_url = "https://console.example.com"
+
+   # SaaS (Splunk Observability Cloud)
+   splunk_ao_realm = "us1"
+   splunk_ao_o11y_token = "..."
+   # splunk_ao_o11y_api_token = "..."
+   # otel_service_name = "sao-demo"
 
    # Agent Control configuration
-   agent_control_url = "https://console.example.com/api/agent-control"
    agent_control_agent_name = "sao-demo-agent"
    agent_control_api_key_header = "Splunk-AO-API-Key"
    agent_control_target_type = "agent_stream"

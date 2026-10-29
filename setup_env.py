@@ -23,6 +23,23 @@ warnings.filterwarnings(
 )
 
 
+_SECRET_PLACEHOLDERS = {
+    "",
+    "...",
+    "https://console.example.com",
+    "https://api.example.com",
+    "https://console.example.com/api/agent-control",
+}
+
+
+def _secret_value(secrets: dict, key: str) -> str:
+    """Return a secrets.toml value, treating template placeholders as unset."""
+    value = str(secrets.get(key, "") or "").strip()
+    if value in _SECRET_PLACEHOLDERS:
+        return ""
+    return value
+
+
 def _derive_sao_api_url(console_url: str, explicit_url: str = "") -> str:
     """Derive Splunk AO API URL from console URL when not set explicitly."""
     if explicit_url:
@@ -35,14 +52,16 @@ def _derive_sao_api_url(console_url: str, explicit_url: str = "") -> str:
     return ""
 
 
-def _derive_agent_control_url(console_url: str, explicit_url: str = "") -> str:
-    """Derive hosted Agent Control proxy URL from the Splunk AO console URL."""
+def _derive_agent_control_url(console_url: str, explicit_url: str = "", realm: str = "") -> str:
+    """Derive Agent Control proxy URL from console URL or SaaS realm."""
     if explicit_url:
         return explicit_url.rstrip("/")
     console_url = (console_url or "").rstrip("/")
-    if not console_url:
-        return ""
-    return f"{console_url}/api/agent-control"
+    if console_url:
+        return f"{console_url}/api/agent-control"
+    if realm:
+        return f"https://app.{realm}.observability.splunkcloud.com/api/agent-control"
+    return ""
 
 
 def get_domain_project_name(domain_name: str, domain_config: Optional[dict] = None) -> str:
@@ -86,17 +105,28 @@ def setup_environment(domain_name: Optional[str] = None, domain_config: Optional
     try:
         secrets = toml.load(secrets_path)
 
-        on_prem_key = secrets.get("splunk_ao_api_key", "")
-        console_url = secrets.get("splunk_ao_console_url", "")
-        sao_api_url = _derive_sao_api_url(console_url, secrets.get("splunk_ao_api_url", ""))
+        on_prem_key = _secret_value(secrets, "splunk_ao_api_key")
+        console_url = _secret_value(secrets, "splunk_ao_console_url")
+        sao_api_url = _derive_sao_api_url(console_url, _secret_value(secrets, "splunk_ao_api_url"))
+        o11y_token = _secret_value(secrets, "splunk_ao_o11y_token")
+        o11y_api_token = _secret_value(secrets, "splunk_ao_o11y_api_token")
+        realm = _secret_value(secrets, "splunk_ao_realm")
+        otel_service_name = _secret_value(secrets, "otel_service_name")
+        logging_disabled = _secret_value(secrets, "splunk_ao_logging_disabled")
         agent_control_url = _derive_agent_control_url(
-            console_url, secrets.get("agent_control_url", "")
+            console_url, _secret_value(secrets, "agent_control_url"), realm
         )
-        o11y_token = secrets.get("splunk_ao_o11y_token", "")
-        o11y_api_token = secrets.get("splunk_ao_o11y_api_token", "")
-        realm = secrets.get("splunk_ao_realm", "")
 
         use_on_prem = bool(on_prem_key and console_url)
+        use_saas = bool(o11y_token and realm)
+        if use_on_prem and use_saas:
+            print(
+                "⚠️  Both on-prem (splunk_ao_api_key + splunk_ao_console_url) and "
+                "SaaS (splunk_ao_o11y_token + splunk_ao_realm) are set. "
+                "Using on-prem and ignoring SaaS. Do not mix these credential sets: "
+                "https://agent-observability-docs.splunk.com/references/faqs/find-keys"
+            )
+            use_saas = False
         agent_control_api_key = on_prem_key if use_on_prem else (o11y_api_token or o11y_token)
 
         env_vars = {
@@ -149,10 +179,15 @@ def setup_environment(domain_name: Optional[str] = None, domain_config: Optional
             env_vars["SPLUNK_AO_API_KEY"] = on_prem_key
             env_vars["SPLUNK_AO_CONSOLE_URL"] = console_url
             env_vars["SPLUNK_AO_API_URL"] = sao_api_url
-        else:
+        elif use_saas:
             env_vars["SPLUNK_AO_O11Y_TOKEN"] = o11y_token
             env_vars["SPLUNK_AO_REALM"] = realm
-            env_vars["SPLUNK_AO_O11Y_API_TOKEN"] = o11y_api_token
+            if o11y_api_token:
+                env_vars["SPLUNK_AO_O11Y_API_TOKEN"] = o11y_api_token
+            if otel_service_name:
+                env_vars["OTEL_SERVICE_NAME"] = otel_service_name
+        if logging_disabled:
+            env_vars["SPLUNK_AO_LOGGING_DISABLED"] = logging_disabled
 
         if domain_name:
             project_name = get_domain_project_name(domain_name, domain_config)

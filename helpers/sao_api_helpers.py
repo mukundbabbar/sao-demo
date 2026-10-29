@@ -10,6 +10,21 @@ import toml
 from pathlib import Path
 
 
+_SECRET_PLACEHOLDERS = {
+    "",
+    "...",
+    "https://console.example.com",
+    "https://api.example.com",
+}
+
+
+def _secret_value(secrets: dict, key: str) -> str:
+    value = str(secrets.get(key, "") or "").strip()
+    if value in _SECRET_PLACEHOLDERS:
+        return ""
+    return value
+
+
 def _load_secrets_if_needed():
     """
     Load secrets from .streamlit/secrets.toml if environment variables are not set.
@@ -27,23 +42,18 @@ def _load_secrets_if_needed():
     try:
         secrets = toml.load(secrets_path)
 
-        if "splunk_ao_api_key" in secrets and not os.environ.get("SPLUNK_AO_API_KEY"):
-            os.environ["SPLUNK_AO_API_KEY"] = secrets["splunk_ao_api_key"]
-
-        if "splunk_ao_console_url" in secrets and not os.environ.get("SPLUNK_AO_CONSOLE_URL"):
-            os.environ["SPLUNK_AO_CONSOLE_URL"] = secrets["splunk_ao_console_url"]
-
-        if "splunk_ao_api_url" in secrets and not os.environ.get("SPLUNK_AO_API_URL"):
-            os.environ["SPLUNK_AO_API_URL"] = secrets["splunk_ao_api_url"]
-
-        if "splunk_ao_o11y_token" in secrets and not os.environ.get("SPLUNK_AO_O11Y_TOKEN"):
-            os.environ["SPLUNK_AO_O11Y_TOKEN"] = secrets["splunk_ao_o11y_token"]
-
-        if "splunk_ao_o11y_api_token" in secrets and not os.environ.get("SPLUNK_AO_O11Y_API_TOKEN"):
-            os.environ["SPLUNK_AO_O11Y_API_TOKEN"] = secrets["splunk_ao_o11y_api_token"]
-
-        if "splunk_ao_realm" in secrets and not os.environ.get("SPLUNK_AO_REALM"):
-            os.environ["SPLUNK_AO_REALM"] = secrets["splunk_ao_realm"]
+        mapping = {
+            "splunk_ao_api_key": "SPLUNK_AO_API_KEY",
+            "splunk_ao_console_url": "SPLUNK_AO_CONSOLE_URL",
+            "splunk_ao_api_url": "SPLUNK_AO_API_URL",
+            "splunk_ao_o11y_token": "SPLUNK_AO_O11Y_TOKEN",
+            "splunk_ao_o11y_api_token": "SPLUNK_AO_O11Y_API_TOKEN",
+            "splunk_ao_realm": "SPLUNK_AO_REALM",
+        }
+        for secret_key, env_key in mapping.items():
+            value = _secret_value(secrets, secret_key)
+            if value and not os.environ.get(env_key):
+                os.environ[env_key] = value
 
     except Exception as e:
         logging.warning(f"Could not load secrets: {e}")
@@ -67,7 +77,7 @@ def get_sao_app_url() -> str:
 
     realm = os.environ.get("SPLUNK_AO_REALM")
     if realm:
-        return f"https://app.{realm}.signalfx.com"
+        return f"https://app.{realm}.observability.splunkcloud.com"
 
     raise ValueError("SPLUNK_AO_CONSOLE_URL or SPLUNK_AO_REALM environment variable is not set")
 
