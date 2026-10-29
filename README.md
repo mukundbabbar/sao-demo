@@ -212,7 +212,7 @@ The app will be available at `http://localhost:8501`
    python start_api.py
    ```
 
-   That runs `opentelemetry-instrument uvicorn api:app --host 0.0.0.0 --port 8000`. The Python OTel agent uses its own OTLP defaults (local collector). Point the banking UI at `http://localhost:8000`.
+   That runs `uvicorn api:app --host 0.0.0.0 --port 8000` (no OTel auto-instrumentor). Session/project ids are stamped on the Splunk AO agent trace. Point the banking UI at `http://localhost:8000`.
 
 ## Model Selection
 

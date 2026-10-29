@@ -1,9 +1,7 @@
 #!/usr/bin/env python3
-"""Start the banking /query API with OTel auto-instrumentation.
+"""Start the banking /query API with plain uvicorn (no OTel auto-instrumentor).
 
-opentelemetry-instrument creates the FastAPI HTTP span using the Python
-agent's own OTLP defaults. api.py stamps Splunk AO correlation attributes
-onto that span.
+Session/project ids are stamped on the Splunk AO agent trace in api.py.
 
 Usage:
     python start_api.py
@@ -14,47 +12,19 @@ from __future__ import annotations
 import os
 import shutil
 import sys
-from pathlib import Path
-
-_PLACEHOLDERS = {"", "..."}
-
-
-def _secret(secrets: dict, key: str) -> str:
-    value = str(secrets.get(key, "") or "").strip()
-    return "" if value in _PLACEHOLDERS else value
-
-
-def _load_secrets() -> dict:
-    try:
-        import toml
-    except ImportError:
-        return {}
-    path = Path(".streamlit/secrets.toml")
-    if not path.exists():
-        return {}
-    return toml.load(path)
-
-
-def configure_otel_from_secrets() -> None:
-    """Set OTEL_SERVICE_NAME if present. Leave exporter settings to the agent."""
-    secrets = _load_secrets()
-    service = _secret(secrets, "otel_service_name") or "sao-demo-api"
-    os.environ.setdefault("OTEL_SERVICE_NAME", service)
 
 
 def main() -> None:
-    configure_otel_from_secrets()
-    instrumentor = shutil.which("opentelemetry-instrument")
-    if not instrumentor:
+    uvicorn = shutil.which("uvicorn")
+    if not uvicorn:
         sys.exit(
-            "opentelemetry-instrument not found. Install deps with "
+            "uvicorn not found. Install deps with "
             "`pip install -r requirements.txt` (needs Python 3.11+)."
         )
     port = os.environ.get("PORT", "8000")
     os.execvp(
-        instrumentor,
+        uvicorn,
         [
-            "opentelemetry-instrument",
             "uvicorn",
             "api:app",
             "--host",

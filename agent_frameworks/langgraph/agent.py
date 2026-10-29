@@ -30,6 +30,8 @@ from splunk_ao.handlers.langchain import SplunkAOCallback
 from helpers.agent_control_helpers import (
     ensure_trace_started,
     finalize_trace,
+    isolate_agent_trace_context,
+    restore_agent_trace_context,
     format_blocked_message,
     init_agent_control,
     notify_control_block,
@@ -490,6 +492,7 @@ class LangGraphAgent(BaseAgent):
     async def _process_query_async(self, messages: List[Dict[str, str]]) -> str:
         """Process a user query asynchronously (required for @control async nodes)."""
         provider_token = set_llm_provider(self.llm_provider)
+        otel_token = isolate_agent_trace_context()
         response = "No response generated"
         try:
             # Load tools if not already loaded (must run under active provider context)
@@ -519,9 +522,10 @@ class LangGraphAgent(BaseAgent):
                 response = message_content_to_text(result["messages"][-1].content)
             return response
         finally:
-            reset_llm_provider(provider_token)
             if self.sao_logger:
                 finalize_trace(self.sao_logger, response)
+            restore_agent_trace_context(otel_token)
+            reset_llm_provider(provider_token)
 
     def process_query(self, messages: List[Dict[str, str]]) -> str:
         """Process a user query and return a response"""

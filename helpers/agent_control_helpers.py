@@ -111,6 +111,41 @@ def _extract_trace_input(messages) -> str:
     return json.dumps(serialized) if serialized else ""
 
 
+def isolate_agent_trace_context():
+    """Return a token that detaches the FastAPI HTTP span as parent.
+
+    Galileo traces were uploaded as a complete tree on flush() and never used
+    the OTel context. Splunk AO traces are OTel spans, so without this the
+    "Run Agent" trace becomes a child of POST /query and looks partial in SAO.
+    """
+    from opentelemetry import context as otel_context
+
+    return otel_context.attach(otel_context.Context())
+
+
+def restore_agent_trace_context(token) -> None:
+    if token is None:
+        return
+    from opentelemetry import context as otel_context
+
+    otel_context.detach(token)
+
+
+def apply_correlation_attrs(sao_logger, attrs: Optional[dict] = None) -> None:
+    """Copy Galileo-style session/project ids onto the active SAO root span."""
+    attrs = attrs or getattr(sao_logger, "correlation_attrs", None)
+    if not attrs:
+        return
+    from opentelemetry import trace
+
+    span = trace.get_current_span()
+    if not span or not span.is_recording():
+        return
+    for key, value in attrs.items():
+        if value is not None:
+            span.set_attribute(key, value)
+
+
 def ensure_trace_started(
     sao_logger,
     messages=None,
@@ -123,7 +158,15 @@ def ensure_trace_started(
         return
     if trace_input is None and messages is not None:
         trace_input = _extract_trace_input(messages)
-    sao_logger.start_trace(input=trace_input or "", name=trace_name)
+    metadata = getattr(sao_logger, "correlation_attrs", None) or None
+    kwargs = {"input": trace_input or "", "name": trace_name}
+    if metadata:
+        kwargs["metadata"] = metadata
+    try:
+        sao_logger.start_trace(**kwargs)
+    except TypeError:
+        sao_logger.start_trace(input=trace_input or "", name=trace_name)
+    apply_correlation_attrs(sao_logger, metadata)
 
 
 def finalize_trace(sao_logger, output: str) -> None:

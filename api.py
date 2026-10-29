@@ -1,12 +1,14 @@
 """
 SAO Demo AI Assistant REST API
 
-Banking UI posts to POST /query. Start with auto-instrumentation so the FastAPI
-HTTP span is exported by the Python OTel agent:
+Banking UI posts to POST /query. Start without the OTel auto-instrumentor:
 
     python start_api.py
     # or:
-    opentelemetry-instrument uvicorn api:app --host 0.0.0.0 --port 8000
+    uvicorn api:app --host 0.0.0.0 --port 8000
+
+Session/project ids are stamped on the Splunk AO "Run Agent" trace (same
+fields Galileo put on the HTTP span).
 """
 
 import os
@@ -91,7 +93,12 @@ app = FastAPI(
 
 
 class EndOtelTraceMiddleware(BaseHTTPMiddleware):
-    """End the HTTP span and flush when the response is ready (one trace per request)."""
+    """Stamp SAO ids on the FastAPI HTTP span. Do not end or flush it.
+
+    Galileo agent traces were a separate upload, so ending/flushing the OTel
+    span here was safe. Splunk AO traces are OTel spans; ending or force_flush
+    here would cut the agent tree or parent it under POST /query.
+    """
 
     async def dispatch(self, request: Request, call_next):
         response = await call_next(request)
@@ -106,12 +113,6 @@ class EndOtelTraceMiddleware(BaseHTTPMiddleware):
                 span.set_status(Status(StatusCode.ERROR))
             else:
                 span.set_status(Status(StatusCode.OK))
-            span.end()
-
-        provider = trace.get_tracer_provider()
-        if hasattr(provider, "force_flush"):
-            provider.force_flush(timeout_millis=5000)
-
         return response
 
 
@@ -236,6 +237,21 @@ async def query(request_body: QueryRequest, request: Request):
     chat_session = get_or_create_session(session_id)
     ensure_sao_session(chat_session)
 
+    sao_id = chat_session.sao_session_id or getattr(
+        chat_session.logger, "session_id", None
+    )
+    correlation_attrs = {
+        "splunk_ao.project_id": project_id,
+        "splunk_ao.agent_stream_id": agent_stream_id,
+        "splunk_ao.session_id": session_id,
+        "splunk_ao_user_session_id": sao_id,
+        "splunk_ao.url": (
+            f"{console_url}/project/{project_id}/agent-streams/{agent_stream_id}"
+        ),
+    }
+    chat_session.logger.correlation_attrs = correlation_attrs
+    request.state.otel_sao_attrs = correlation_attrs
+
     chat_session.messages.append(
         {"role": "user", "content": request_body.question}
     )
@@ -248,19 +264,6 @@ async def query(request_body: QueryRequest, request: Request):
     chat_session.messages.append(
         {"role": "assistant", "content": response}
     )
-
-    sao_id = chat_session.sao_session_id or getattr(
-        chat_session.logger, "session_id", None
-    )
-    request.state.otel_sao_attrs = {
-        "splunk_ao.project_id": project_id,
-        "splunk_ao.agent_stream_id": agent_stream_id,
-        "splunk_ao.session_id": session_id,
-        "splunk_ao_user_session_id": sao_id,
-        "splunk_ao.url": (
-            f"{console_url}/project/{project_id}/agent-streams/{agent_stream_id}"
-        ),
-    }
 
     return {
         "answer": response,
