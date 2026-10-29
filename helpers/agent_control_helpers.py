@@ -116,30 +116,44 @@ def _extract_trace_input(messages) -> str:
     return json.dumps(serialized) if serialized else ""
 
 
-class _CorrelationSpanProcessor:
+try:
+    from opentelemetry.sdk.trace import SpanProcessor as _OtelSpanProcessor
+except Exception:  # pragma: no cover - API-only environments
+    class _OtelSpanProcessor:  # type: ignore[no-redef]
+        pass
+
+
+class _CorrelationSpanProcessor(_OtelSpanProcessor):
     """Stamp IDs on every OTel span SAO actually exports (invoke_agent, PII, …)."""
 
     def on_start(self, span, parent_context=None):
-        attrs = _correlation_attrs.get() or _correlation_attrs_fallback
-        if not attrs or span is None:
-            return
-        set_attr = getattr(span, "set_attribute", None)
-        if set_attr is None:
-            return
-        for key, value in attrs.items():
-            if value is None or value == "":
-                continue
-            try:
-                set_attr(str(key), str(value))
-            except Exception:
-                continue
-        print(
-            f"[otel] processor on_start span={getattr(span, 'name', None)!r} "
-            f"attrs={attrs}"
-        )
+        try:
+            attrs = _correlation_attrs.get() or _correlation_attrs_fallback
+            if not attrs or span is None:
+                return
+            set_attr = getattr(span, "set_attribute", None)
+            if set_attr is None:
+                return
+            for key, value in attrs.items():
+                if value is None or value == "":
+                    continue
+                try:
+                    set_attr(str(key), str(value))
+                except Exception:
+                    continue
+            print(
+                f"[otel] processor on_start span={getattr(span, 'name', None)!r} "
+                f"attrs={attrs}"
+            )
+        except Exception as exc:
+            print(f"[otel] processor on_start failed: {exc}")
 
     def on_end(self, span):
         return None
+
+    def _on_ending(self, span):
+        # OTel SDK 1.38+ calls _on_ending instead of on_end on custom processors.
+        return self.on_end(span)
 
     def shutdown(self):
         return None
