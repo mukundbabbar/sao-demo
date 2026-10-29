@@ -178,7 +178,6 @@ def get_or_create_session(session_id: str) -> ChatSession:
             project_name=project_name,
             agent_stream=agent_stream_name,
         )
-        logger.enable_agent_control()
         init_agent_control(
             logger,
             project_name=project_name,
@@ -234,12 +233,12 @@ async def query(request_body: QueryRequest, request: Request):
         {"role": "user", "content": request_body.question}
     )
 
-    response = await asyncio.to_thread(
-        chat_session.agent.process_query,
+    response = await chat_session.agent.process_query_async(
         chat_session.messages,
         metadata=trace_metadata,
     )
 
+    chat_session.logger = chat_session.agent.sao_logger or chat_session.logger
     chat_session.sao_session_id = getattr(
         chat_session.logger, "session_id", None
     ) or chat_session.sao_session_id

@@ -11,6 +11,7 @@ import asyncio
 from concurrent.futures import ThreadPoolExecutor
 from typing import Annotated, TypedDict, List, Dict, Any, Optional
 from langgraph.graph.message import add_messages
+from langchain_core.callbacks import AsyncCallbackHandler
 from langchain_core.messages import BaseMessage, SystemMessage, HumanMessage
 from langchain_core.tools import StructuredTool
 from langchain_core.messages import AIMessage, ToolMessage
@@ -20,17 +21,25 @@ from helpers.llm_utils import (
     reset_llm_provider,
     set_llm_provider,
 )
+from opentelemetry import trace as otel_trace
 from langgraph.graph import START, StateGraph
 from langgraph.graph.state import CompiledStateGraph
 from langgraph.prebuilt import ToolNode, tools_condition
 from agent_control import ControlSteerError, ControlViolationError, control
 from base_agent import BaseAgent
 from domain_manager import DomainConfig
+from splunk_ao import splunk_ao_context
 from splunk_ao.handlers.langchain import SplunkAOCallback
+
+try:
+    from splunk_ao.handlers.langchain import SplunkAOAsyncCallback
+except ImportError:
+    SplunkAOAsyncCallback = SplunkAOCallback
 from helpers.agent_control_helpers import (
     attach_control_bridge,
     ensure_logger_session,
     ensure_trace_started,
+    stamp_otel_attributes,
     finalize_trace,
     logger_id_metadata,
     format_blocked_message,
@@ -76,6 +85,32 @@ def _run_async(coro):
         return executor.submit(asyncio.run, coro).result()
 
 
+
+
+class OtelCorrelationCallback(AsyncCallbackHandler):
+    """Copy project/stream/session IDs onto each live OTel span as it starts."""
+
+    def __init__(self, attrs: Optional[dict] = None):
+        super().__init__()
+        self.attrs = attrs or {}
+
+    def _stamp(self, where: str) -> None:
+        stamp_otel_attributes(self.attrs, where=where)
+
+    async def on_chain_start(self, serialized, inputs, **kwargs):
+        self._stamp("invoke_workflow")
+
+    async def on_llm_start(self, serialized, prompts, **kwargs):
+        self._stamp("llm")
+
+    async def on_chat_model_start(self, serialized, messages, **kwargs):
+        self._stamp("chat")
+
+    async def on_tool_start(self, serialized, input_str, **kwargs):
+        self._stamp("tool")
+
+    async def on_agent_start(self, serialized, inputs, **kwargs):
+        self._stamp("invoke_agent")
 
 
 def _message_content_text(message: BaseMessage) -> str:
@@ -227,15 +262,37 @@ class LangGraphAgent(BaseAgent):
         # Build callbacks list with Splunk AO (always enabled).
         # Pass the per-session logger so each browser tab writes to its own SAO session.
         # Attach LangGraph spans to a manually started trace (see _process_query_async).
+        self.config = self._callback_config(sao_logger)
+
+    def _callback_config(self, sao_logger, otel_attrs: Optional[dict] = None) -> dict:
+        """ainvoke requires the async callback; otherwise traces go to a second logger."""
         callbacks = [
-            SplunkAOCallback(
+            SplunkAOAsyncCallback(
                 splunk_ao_logger=sao_logger,
                 start_new_trace=False,
                 flush_on_chain_end=False,
             )
         ]
-        
-        self.config = {"configurable": {"thread_id": self.session_id}, "callbacks": callbacks}
+        if otel_attrs:
+            callbacks.append(OtelCorrelationCallback(otel_attrs))
+        return {
+            "configurable": {"thread_id": self.session_id},
+            "callbacks": callbacks,
+        }
+
+    def _sao_project_stream(self) -> tuple[str, str]:
+        sao_cfg = self.domain_config.config.get("splunk_ao", {})
+        project_name = (
+            sao_cfg.get("project")
+            or os.environ.get("SPLUNK_AO_PROJECT")
+            or f"sao-demo-{self.domain_config.name}"
+        )
+        agent_stream = (
+            sao_cfg.get("agent_stream")
+            or os.environ.get("SPLUNK_AO_AGENT_STREAM")
+            or "default"
+        )
+        return project_name, agent_stream
     
     def load_tools(self) -> None:
         """Load tools from the domain's tools directory and add RAG if enabled"""
@@ -352,9 +409,7 @@ class LangGraphAgent(BaseAgent):
         print(f"✓ Loaded {len(self.tools)} tools for domain '{self.domain_config.name}'")
 
         if self.sao_logger:
-            sao_cfg = self.domain_config.config.get("splunk_ao", {})
-            project_name = sao_cfg.get("project") or f"sao-demo-{self.domain_config.name}"
-            agent_stream = sao_cfg.get("agent_stream", "default")
+            project_name, agent_stream = self._sao_project_stream()
             init_agent_control(
                 self.sao_logger,
                 project_name=project_name,
@@ -496,48 +551,95 @@ class LangGraphAgent(BaseAgent):
         """Process a user query asynchronously (required for @control async nodes)."""
         provider_token = set_llm_provider(self.llm_provider)
         response = "No response generated"
-        try:
-            if self.sao_logger and self.session_id:
-                ensure_logger_session(
-                    self.sao_logger,
-                    name=f"{self.domain_config.name.title()} Agent Demo",
-                    external_id=self.session_id,
+        project_name, agent_stream = self._sao_project_stream()
+        session_name = f"{self.domain_config.name.title()} Agent Demo"
+        # @control and the LangChain callback log through splunk_ao_context, not a
+        # private SplunkAOLogger. start_session on a private logger created the
+        # empty "Bank Agent Demo"; traces landed on the context logger as "session".
+        with splunk_ao_context(project=project_name, agent_stream=agent_stream):
+            logger = splunk_ao_context.get_logger_instance()
+            try:
+                if self.session_id:
+                    ensure_logger_session(
+                        logger,
+                        name=session_name,
+                        external_id=self.session_id,
+                        metadata=metadata,
+                    )
+                    metadata = logger_id_metadata(logger, metadata)
+                logger.enable_agent_control()
+                self.sao_logger = logger
+                self.config = self._callback_config(logger, otel_attrs=metadata)
+
+                # Load tools if not already loaded (must run under active provider context)
+                if not self.tools:
+                    self.load_tools()
+
+                self.graph = self._build_graph()
+
+                langchain_messages = []
+                for msg in messages:
+                    if msg["role"] == "user":
+                        langchain_messages.append(HumanMessage(content=msg["content"]))
+                    elif msg["role"] == "assistant":
+                        langchain_messages.append(AIMessage(content=msg["content"]))
+
+                initial_state = {"messages": langchain_messages, "steer_attempts": 0}
+                ensure_trace_started(
+                    logger,
+                    langchain_messages,
+                    trace_name="Run Agent",
                     metadata=metadata,
                 )
-                metadata = logger_id_metadata(self.sao_logger, metadata)
+                metadata = logger_id_metadata(logger, metadata)
+                self.config = self._callback_config(logger, otel_attrs=metadata)
+                attach_control_bridge(logger)
 
-            # Load tools if not already loaded (must run under active provider context)
-            if not self.tools:
-                self.load_tools()
+                # @control starts an OTel span named after the control
+                # (PII_Input_output_Luna-clone). If that is the current span, it
+                # becomes the trace root and LangGraph nests under it. Galileo
+                # traces were not OTel, so this did not happen there.
+                # https://agent-observability-docs.splunk.com/sdk-api/python/reference/handlers/agent_control/bridge
+                async def _ainvoke():
+                    stamp_otel_attributes(metadata, where="ainvoke")
+                    return await self.graph.ainvoke(initial_state, self.config)
 
-            self.graph = self._build_graph()
+                current = otel_trace.get_current_span()
+                if current is not None and current.is_recording():
+                    stamp_otel_attributes(metadata, where="current", span=current)
+                    result = await _ainvoke()
+                else:
+                    with otel_trace.get_tracer("sao-demo").start_as_current_span(
+                        "Run Agent"
+                    ) as run_span:
+                        stamp_otel_attributes(
+                            metadata, where="Run Agent", span=run_span
+                        )
+                        result = await _ainvoke()
+                if result["messages"]:
+                    # ChatBedrockConverse returns .content as a list of blocks;
+                    # normalize to a string so downstream (UI/tracing) stays str-based.
+                    response = message_content_to_text(result["messages"][-1].content)
+                return response
+            finally:
+                finalize_trace(logger, response)
+                reset_llm_provider(provider_token)
 
-            langchain_messages = []
-            for msg in messages:
-                if msg["role"] == "user":
-                    langchain_messages.append(HumanMessage(content=msg["content"]))
-                elif msg["role"] == "assistant":
-                    langchain_messages.append(AIMessage(content=msg["content"]))
-
-            initial_state = {"messages": langchain_messages, "steer_attempts": 0}
-            ensure_trace_started(
-                self.sao_logger,
-                langchain_messages,
-                trace_name="Run Agent",
-                metadata=metadata,
-            )
-            attach_control_bridge(self.sao_logger)
-
-            result = await self.graph.ainvoke(initial_state, self.config)
-            if result["messages"]:
-                # ChatBedrockConverse returns .content as a list of blocks;
-                # normalize to a string so downstream (UI/tracing) stays str-based.
-                response = message_content_to_text(result["messages"][-1].content)
-            return response
-        finally:
-            if self.sao_logger:
-                finalize_trace(self.sao_logger, response)
-            reset_llm_provider(provider_token)
+    async def process_query_async(
+        self, messages: List[Dict[str, str]], metadata: Optional[dict] = None
+    ) -> str:
+        """Async entry used by FastAPI so session/trace stay on the request context."""
+        try:
+            return await self._process_query_async(messages, metadata=metadata)
+        except ControlViolationError as e:
+            return format_blocked_message(e, step_name="Bank Assistant")
+        except ControlSteerError as e:
+            return format_blocked_message(e, step_name="Bank Assistant", steered=True)
+        except Exception as e:
+            print(f"[ERROR] Error processing query: {e}")
+            import traceback
+            traceback.print_exc()
+            return f"Error processing your request: {str(e)}"
 
     def process_query(
         self, messages: List[Dict[str, str]], metadata: Optional[dict] = None

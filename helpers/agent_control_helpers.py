@@ -112,6 +112,35 @@ def _extract_trace_input(messages) -> str:
     return json.dumps(serialized) if serialized else ""
 
 
+def stamp_otel_attributes(
+    attrs: Optional[dict],
+    *,
+    where: str = "",
+    span=None,
+) -> None:
+    """Set correlation IDs on the live OpenTelemetry span (not SAO metadata)."""
+    from opentelemetry import trace as otel_trace
+
+    if span is None:
+        span = otel_trace.get_current_span()
+    if span is None or not span.is_recording():
+        print(f"[otel] skip stamp {where}: no recording span")
+        return
+    ctx = span.get_span_context()
+    name = getattr(span, "name", None) or where
+    stamped = {}
+    for key, value in (attrs or {}).items():
+        if value is None or value == "":
+            continue
+        span.set_attribute(str(key), str(value))
+        stamped[str(key)] = str(value)
+    print(
+        f"[otel] stamped {where} span={name!r} "
+        f"trace_id={format(ctx.trace_id, '032x') if ctx and ctx.trace_id else None} "
+        f"attrs={stamped}"
+    )
+
+
 def string_metadata(raw: Optional[dict] = None) -> dict:
     """Flat string metadata for start_session / start_trace (SDK requires str keys/values)."""
     if not raw:
