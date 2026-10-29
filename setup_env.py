@@ -200,8 +200,11 @@ def setup_environment(domain_name: Optional[str] = None, domain_config: Optional
             env_vars["SPLUNK_AO_REALM"] = realm
             if o11y_api_token:
                 env_vars["SPLUNK_AO_O11Y_API_TOKEN"] = o11y_api_token
-            if otel_service_name:
-                env_vars["OTEL_SERVICE_NAME"] = otel_service_name
+        env_vars["OTEL_SERVICE_NAME"] = (
+            otel_service_name
+            or os.environ.get("OTEL_SERVICE_NAME")
+            or "sao-demo-api"
+        )
         if logging_disabled:
             env_vars["SPLUNK_AO_LOGGING_DISABLED"] = logging_disabled
 
