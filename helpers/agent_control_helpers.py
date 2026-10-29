@@ -16,6 +16,7 @@ from agent_control.settings import configure_settings
 _initialized = False
 _correlation_attrs: ContextVar[dict] = ContextVar("sao_otel_corr", default={})
 _correlation_attrs_fallback: dict = {}
+_active_sao_logger: ContextVar[Any] = ContextVar("active_sao_logger", default=None)
 _processor_provider_ids: set[int] = set()
 MAX_STEER_RETRIES = 3
 STEER_EXHAUSTED_MESSAGE = (
@@ -160,6 +161,37 @@ class _CorrelationSpanProcessor(_OtelSpanProcessor):
 
     def force_flush(self, timeout_millis=0):
         return True
+
+
+def set_active_sao_logger(sao_logger) -> Token:
+    """Bind this request's SplunkAOLogger for tools that cannot see Streamlit state."""
+    return _active_sao_logger.set(sao_logger)
+
+
+def reset_active_sao_logger(token: Optional[Token]) -> None:
+    if token is None:
+        return
+    try:
+        _active_sao_logger.reset(token)
+    except Exception:
+        pass
+
+
+def get_active_sao_logger():
+    return _active_sao_logger.get()
+
+
+def streamlit_sao_logger(key: str):
+    """Read Streamlit's per-tab logger only when a Streamlit script is running."""
+    try:
+        from streamlit.runtime.scriptrunner import get_script_run_ctx
+        import streamlit as st
+
+        if get_script_run_ctx() is None:
+            return None
+        return st.session_state.get(key)
+    except Exception:
+        return None
 
 
 def register_correlation_processor() -> None:
@@ -701,11 +733,10 @@ def ensure_logger_session(
     external_id: str,
     metadata: Optional[dict] = None,
 ) -> Optional[str]:
-    """Attach the default SAO session on the current thread.
+    """Start or reuse the named session on this thread (SAO session is thread-local).
 
-    Do not pass a custom name — that created empty "AI Assistant" next to
-    auto "session". Omit name so the server keeps "session". external_id
-    reuses one session per browser tab.
+    Must run on the same thread as start_trace / ainvoke. external_id reuses
+    one session per browser tab.
     https://agent-observability-docs.splunk.com/concepts/logging/sessions/using-sessions
     """
     if sao_logger is None or not external_id:

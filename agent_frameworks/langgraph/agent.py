@@ -34,6 +34,9 @@ except ImportError:
     SplunkAOAsyncCallback = SplunkAOCallback
 from helpers.agent_control_helpers import (
     attach_control_bridge,
+    ensure_logger_session,
+    ensure_trace_started,
+    finalize_trace,
     format_blocked_message,
     init_agent_control,
     notify_control_block,
@@ -45,8 +48,14 @@ from helpers.agent_control_helpers import (
     STEER_EXHAUSTED_MESSAGE,
     extract_steering_instructions,
     build_steer_correction_prompt,
+    reset_active_sao_logger,
+    set_active_sao_logger,
 )
-from helpers.sao_otel import run_agent_span
+from helpers.sao_otel import (
+    activate_sao_parent,
+    isolate_http_parent,
+    restore_otel_context,
+)
 
 # Streamlit import (optional - for UI integration)
 try:
@@ -243,7 +252,7 @@ class LangGraphAgent(BaseAgent):
         self.model_override = model_override
         self.sao_logger = sao_logger
         self.llm_provider = llm_provider if llm_provider in ("local", "hosted", "bedrock") else "local"
-        self.sao_session_name = None
+        self.sao_session_name = "AI Assistant"
         self.sao_session_id = None
 
         # Same as Galileo: bind the per-session logger once. start_new_trace=False
@@ -524,46 +533,70 @@ class LangGraphAgent(BaseAgent):
         """Process a user query asynchronously (required for @control async nodes)."""
         provider_token = set_llm_provider(self.llm_provider)
         response = "No response generated"
+        http_token = isolate_http_parent()
+        parent_token = None
+        logger_token = None
         try:
-            # Do not call start_session/start_trace here. Those created the
-            # extra empty unnamed session. The default session named "session"
-            # is created by the callback/OTel tree. Wrap in Run Agent so
-            # @control is a child, matching Galileo.
-            with run_agent_span("Run Agent") as run_span:
-                if metadata:
-                    for key, value in metadata.items():
-                        if value is not None and value != "":
-                            run_span.set_attribute(str(key), str(value))
+            # SAO session is thread-local. Galileo stored it on the logger so
+            # api.py could start_session on the FastAPI thread. Do the whole
+            # sequence here, same thread as ainvoke:
+            # start_session → Agent Control → start_trace("Run Agent") → invoke
+            # https://agent-observability-docs.splunk.com/how-to-guides/agent-control/initialize-and-configure-agent-control
+            if self.sao_logger:
+                logger_token = set_active_sao_logger(self.sao_logger)
+                sao_id = ensure_logger_session(
+                    self.sao_logger,
+                    name=getattr(self, "sao_session_name", None) or "AI Assistant",
+                    external_id=self.session_id,
+                    metadata=metadata,
+                )
+                self.sao_session_id = sao_id
+                print(
+                    f"[sao] worker session sao_id={sao_id} "
+                    f"name={getattr(self, 'sao_session_name', None)!r} "
+                    f"external_id={self.session_id!r} "
+                    f"project_id={getattr(self.sao_logger, 'project_id', None)!r} "
+                    f"agent_stream_id={getattr(self.sao_logger, 'agent_stream_id', None)!r}"
+                )
+                project_name, agent_stream = self._sao_project_stream()
+                init_agent_control(
+                    self.sao_logger,
+                    project_name=project_name,
+                    agent_stream=agent_stream,
+                    agent_description=f"{self.domain_config.name.title()} demo agent",
+                )
 
-                if self.sao_logger:
-                    self.sao_logger.enable_agent_control()
-                    project_name, agent_stream = self._sao_project_stream()
-                    init_agent_control(
-                        self.sao_logger,
-                        project_name=project_name,
-                        agent_stream=agent_stream,
-                        agent_description=f"{self.domain_config.name.title()} demo agent",
-                    )
+            if not self.tools:
+                self.load_tools()
 
-                if not self.tools:
-                    self.load_tools()
+            self.graph = self._build_graph()
 
-                self.graph = self._build_graph()
+            langchain_messages = []
+            for msg in messages:
+                if msg["role"] == "user":
+                    langchain_messages.append(HumanMessage(content=msg["content"]))
+                elif msg["role"] == "assistant":
+                    langchain_messages.append(AIMessage(content=msg["content"]))
 
-                langchain_messages = []
-                for msg in messages:
-                    if msg["role"] == "user":
-                        langchain_messages.append(HumanMessage(content=msg["content"]))
-                    elif msg["role"] == "assistant":
-                        langchain_messages.append(AIMessage(content=msg["content"]))
-
-                initial_state = {"messages": langchain_messages, "steer_attempts": 0}
-                attach_control_bridge(self.sao_logger)
-                result = await self.graph.ainvoke(initial_state, self.config)
-                if result["messages"]:
-                    response = message_content_to_text(result["messages"][-1].content)
-                return response
+            initial_state = {"messages": langchain_messages, "steer_attempts": 0}
+            ensure_trace_started(
+                self.sao_logger,
+                langchain_messages,
+                trace_name="Run Agent",
+                metadata=metadata,
+            )
+            parent_token = activate_sao_parent(self.sao_logger)
+            attach_control_bridge(self.sao_logger)
+            result = await self.graph.ainvoke(initial_state, self.config)
+            if result["messages"]:
+                response = message_content_to_text(result["messages"][-1].content)
+            return response
         finally:
+            restore_otel_context(parent_token)
+            if self.sao_logger:
+                finalize_trace(self.sao_logger, response)
+            restore_otel_context(http_token)
+            reset_active_sao_logger(logger_token)
             reset_llm_provider(provider_token)
 
     async def process_query_async(

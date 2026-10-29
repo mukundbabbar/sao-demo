@@ -222,12 +222,10 @@ def get_or_create_session(session_id: str) -> ChatSession:
 
 
 def ensure_sao_session(chat_session: ChatSession) -> None:
-    """Do not start a named session here.
-
-    A custom name created empty "AI Assistant" next to auto "session".
-    process_query starts the default session on the worker (no name).
+    """Galileo started the session here. SAO session is thread-local, so
+    process_query starts it on the worker with this name + external_id.
     """
-    chat_session.agent.sao_session_name = None
+    chat_session.agent.sao_session_name = "AI Assistant"
     cached = _sao_session_ids.get(chat_session.session_id)
     if cached:
         chat_session.sao_session_id = cached

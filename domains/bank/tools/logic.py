@@ -10,7 +10,6 @@ import sys
 import time
 import json
 import logging
-import streamlit as st
 from pathlib import Path
 from typing import List, Optional, Tuple
 
@@ -31,7 +30,11 @@ _root = str(_ROOT)
 if _root not in sys.path:
     sys.path.insert(0, _root)
 
-from helpers.agent_control_helpers import domain_controlled_tool
+from helpers.agent_control_helpers import (
+    domain_controlled_tool,
+    get_active_sao_logger,
+    streamlit_sao_logger,
+)
 from helpers.llm_utils import get_domain_chat_model, get_domain_embedding_model, resolve_embedding_provider
 from helpers.sql_utils import execute_sql, relational_table_name
 from helpers.text_to_sql_utils import generate_sql
@@ -43,12 +46,11 @@ _collection_name_cached: Optional[str] = None
 _provider_cached: Optional[str] = None
 
 sao_logger_key = "sao_logger_bank"
-if st.session_state.get(sao_logger_key):
-    print(f"[log.py] --> SAO logger found! {st.session_state[sao_logger_key]}", flush=True)
-    sao_logger = st.session_state[sao_logger_key]
+sao_logger = streamlit_sao_logger(sao_logger_key)
+if sao_logger:
+    print(f"[log.py] --> SAO logger found! {sao_logger}", flush=True)
 else:
-    print("[log.py] --> SAO logger not found!", flush=True)
-    sao_logger = None
+    print("[log.py] --> SAO logger will resolve from the active API/Streamlit request", flush=True)
 
 
 def _ensure_project_path() -> None:
@@ -106,6 +108,7 @@ def _log_tool_span(
     metadata: Optional[dict] = None,
     tags: Optional[List[str]] = None,
 ) -> None:
+    sao_logger = sao_logger or get_active_sao_logger()
     if not sao_logger:
         return
     sao_logger.add_tool_span(
@@ -126,13 +129,12 @@ def _log_retriever_span(
     metadata: Optional[dict] = None,
     tags: Optional[List[str]] = None,
 ) -> None:
-    global sao_logger
-
-    if not sao_logger:
+    logger = get_active_sao_logger() or sao_logger
+    if not logger:
         print("[_log_retriever_span] --> No SAO logger found", flush=True)
         return
 
-    sao_logger.add_retriever_span(
+    logger.add_retriever_span(
         input=json.dumps(tool_input),
         output=json.dumps(tool_output),
         name=name,
@@ -140,17 +142,12 @@ def _log_retriever_span(
         metadata=metadata or {},
         tags=tags or ["bank"],
     )
-    print(f"[_log_retriever_span] --> SAO logger found! {sao_logger.trace_id}_", flush=True)
+    print(f"[_log_retriever_span] --> SAO logger found! {logger.trace_id}_", flush=True)
 
 
 def _resolve_sao_logger(*_args, **_kwargs) -> Optional[SplunkAOLogger]:
     global sao_logger
-    if sao_logger is not None:
-        return sao_logger
-    try:
-        return st.session_state.get(sao_logger_key)
-    except Exception:
-        return None
+    return get_active_sao_logger() or sao_logger or streamlit_sao_logger(sao_logger_key)
 
 
 @domain_controlled_tool(step_name="get_customer_info", resolve_logger=_resolve_sao_logger)

@@ -11,8 +11,6 @@ https://help.splunk.com/en/splunk-observability-cloud/observability-for-ai/splun
 """
 from __future__ import annotations
 
-from contextlib import contextmanager
-
 from opentelemetry import context as otel_context
 from opentelemetry import trace as otel_trace
 
@@ -33,25 +31,54 @@ def restore_otel_context(token) -> None:
         pass
 
 
-@contextmanager
-def run_agent_span(name: str = "Run Agent"):
-    """Complete root span named Run Agent (Galileo trace name).
+def _as_recording_span(obj):
+    """Unwrap a SAO parent object to a recording OTel span, if present."""
+    if obj is None:
+        return None
+    seen: set[int] = set()
+    stack = [obj]
+    while stack:
+        current = stack.pop()
+        if current is None or id(current) in seen:
+            continue
+        seen.add(id(current))
+        is_recording = getattr(current, "is_recording", None)
+        get_ctx = getattr(current, "get_span_context", None)
+        if callable(is_recording) and callable(get_ctx):
+            try:
+                if is_recording():
+                    return current
+            except Exception:
+                return current
+        for attr in ("span", "_span", "otel_span", "_otel_span", "current_span"):
+            child = getattr(current, attr, None)
+            if child is not None:
+                stack.append(child)
+    return None
 
-    Isolate POST /query first so this is not a Partial HTTP child. Agent
-    Control @control spans then nest under Run Agent instead of becoming
-    the root.
+
+def activate_sao_parent(sao_logger):
+    """Make logger.start_trace('Run Agent') the current OTel span.
+
+    @control emits an OTel span. If nothing is current, that control becomes
+    the root. Galileo's start_trace was the parent; SAO needs it activated.
     """
-    http_token = isolate_http_parent()
-    tracer = otel_trace.get_tracer("sao-demo")
-    span = tracer.start_span(name)
-    span_token = otel_context.attach(otel_trace.set_span_in_context(span))
-    try:
-        yield span
-    finally:
-        if span.is_recording():
-            span.end()
-        restore_otel_context(span_token)
-        restore_otel_context(http_token)
+    parent = None
+    if sao_logger is not None:
+        try:
+            parent = sao_logger.current_parent()
+        except Exception as exc:
+            print(f"[otel] current_parent failed: {exc}")
+    span = _as_recording_span(parent)
+    if span is None:
+        current = otel_trace.get_current_span()
+        if current is not None and current.is_recording():
+            span = current
+    if span is None:
+        print("[otel] no Run Agent parent to activate")
+        return None
+    print(f"[otel] activate parent span={getattr(span, 'name', None)!r}")
+    return otel_context.attach(otel_trace.set_span_in_context(span))
 
 
 def init_sao_otel() -> None:
