@@ -142,7 +142,6 @@ def _log_retriever_span(
         metadata=metadata or {},
         tags=tags or ["bank"],
     )
-    print(f"[_log_retriever_span] --> SAO logger found! {logger.trace_id}_", flush=True)
 
 
 def _resolve_sao_logger(*_args, **_kwargs) -> Optional[SplunkAOLogger]:
