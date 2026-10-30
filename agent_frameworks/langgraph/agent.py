@@ -535,23 +535,28 @@ class LangGraphAgent(BaseAgent):
         try:
             if self.sao_logger:
                 logger_token = set_active_sao_logger(self.sao_logger)
-                # One Splunk AO session per browser tab: group spans by a stable
-                # conversation id. No start_session() -> no extra empty session.
+                # One Splunk AO session per browser tab, keyed by a stable id that
+                # is also the session's external id (see bind_conversation).
                 self.sao_session_id = conversation_id_for(self.session_id or "default")
-                bind_conversation(self.sao_logger, self.sao_session_id)
-                # Plain OTel attributes on every span SAO exports for this run.
-                span_attrs = logger_id_metadata(
+                base_attrs = logger_id_metadata(
                     self.sao_logger,
                     {
                         **(metadata or {}),
                         "splunk_ao_user_session_id": self.sao_session_id,
                         "sao_session_id": self.sao_session_id,
-                        "splunk_ao.session.id": self.sao_session_id,
                     },
                 )
+                # One named session per tab: created once, spans join it by id.
+                bind_conversation(
+                    self.sao_logger,
+                    self.sao_session_id,
+                    session_name="AI Assistant",
+                    metadata=base_attrs,
+                )
+                # Plain OTel attributes on every span SAO exports for this run.
                 holder = install_span_attributes(self.sao_logger)
                 holder.clear()
-                holder.update(span_attrs)
+                holder.update(base_attrs)
                 project_name, agent_stream = self._sao_project_stream()
                 init_agent_control(
                     self.sao_logger,

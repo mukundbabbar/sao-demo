@@ -523,33 +523,78 @@ def wrap_controlled_langchain_tool(tool, sao_logger, step_name: str = "retrieval
     )
 
 
-def bind_conversation(sao_logger, conversation_id: str) -> None:
-    """Group this logger's spans into one Splunk AO session, without start_session().
+def bind_conversation(
+    sao_logger,
+    conversation_id: str,
+    *,
+    session_name: Optional[str] = None,
+    metadata: Optional[dict] = None,
+) -> None:
+    """Make every span of this tab land in ONE named Splunk AO session.
 
-    start_session() creates a separate session record (the empty extra session).
-    Spans are grouped by gen_ai.conversation.id, which set_session() just
-    records on the logger; no network call, no new session record.
+    The OTel spans carry gen_ai.conversation.id, and Splunk AO matches that value
+    to a session's *external id* (not to its internal id). start_session() makes
+    the named session record (external_id=conversation_id) but then also switches
+    the logger to the record's internal id, so spans carried a different id and
+    the backend auto-created a second session called "session" while the named
+    one stayed empty. Fix: create/find the named session once, then point the
+    logger back at the external id, so spans join that same session.
     https://agent-observability-docs.splunk.com/sdk-api/python/reference/logger/logger
     """
     if sao_logger is None or not conversation_id:
         return
+    if session_name and not getattr(sao_logger, "_demo_named_session", None):
+        try:
+            record_id = sao_logger.start_session(
+                name=session_name,
+                external_id=conversation_id,
+                metadata=string_metadata(metadata) or None,
+            )
+            sao_logger._demo_named_session = record_id or conversation_id
+            print(
+                f"[sao] session '{session_name}' ready record_id={record_id!r} "
+                f"external_id={conversation_id!r}"
+            )
+        except Exception as exc:
+            print(f"⚠️ Could not create named Splunk AO session: {exc}")
+    # Always (re)select the external id for spans created from this context.
     sao_logger.set_session(conversation_id)
+
+
+def _instrument_control_bridge(bridge) -> None:
+    """Log how many Agent Control events become control spans (accepted) or are dropped."""
+    if bridge is None or getattr(bridge, "_demo_counting", False):
+        return
+    original = bridge.write_events
+
+    def counting_write_events(events):
+        result = original(events)
+        try:
+            print(
+                f"[agent-control] events={len(events)} "
+                f"accepted={getattr(result, 'accepted', '?')} "
+                f"dropped={getattr(result, 'dropped', '?')}"
+            )
+        except Exception:
+            pass
+        return result
+
+    bridge.write_events = counting_write_events
+    bridge._demo_counting = True
 
 
 def attach_control_bridge(sao_logger) -> None:
     """Register the Agent Control bridge on this thread after start_trace.
 
-    Control spans are leaves on the active Splunk AO parent. If the bridge is
-    missing, @control emits a standalone OTel span named after the control
-    (e.g. PII_Input_output_Luna-clone) and SAO auto-creates a session named
-    "session". Galileo's enable_agent_control() attached those as children of
-    Run Agent instead.
+    Control spans are leaves on the active Splunk AO parent, so they nest under
+    "Run Agent" and never become a root span.
     https://agent-observability-docs.splunk.com/sdk-api/python/reference/handlers/agent_control/bridge
     """
     if sao_logger is None:
         return
     try:
-        sao_logger.enable_agent_control()
+        bridge = sao_logger.enable_agent_control()
+        _instrument_control_bridge(bridge)
     except Exception as exc:
         print(f"⚠️ Agent Control bridge not attached: {exc}")
 
