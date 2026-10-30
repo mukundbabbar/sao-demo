@@ -561,6 +561,31 @@ def bind_conversation(
     sao_logger.set_session(conversation_id)
 
 
+def _explain_control_span_failure(bridge, events) -> None:
+    """Run the SDK conversion without its exception swallowing to expose the error."""
+    import inspect
+    import traceback
+
+    logger = bridge._splunk_ao_logger
+    for ev in events:
+        name = getattr(ev, "control_name", None)
+        try:
+            kwargs = bridge._control_span_kwargs(ev)
+        except Exception:
+            print(f"[agent-control] '{name}': could not build span fields:\n{traceback.format_exc()}")
+            continue
+        try:
+            raw = inspect.unwrap(type(logger).add_control_span)
+            span = raw(logger, **kwargs)
+            print(
+                f"[agent-control] '{name}': direct add_control_span -> "
+                f"{'created' if span is not None else 'None (SDK skipped it)'}; "
+                f"parent={getattr(logger.current_parent(), 'name', None)!r}"
+            )
+        except Exception:
+            print(f"[agent-control] '{name}': add_control_span raised:\n{traceback.format_exc()}")
+
+
 def _instrument_control_bridge(bridge) -> None:
     """Explain why Agent Control events do not become control spans.
 
@@ -573,6 +598,7 @@ def _instrument_control_bridge(bridge) -> None:
     original = bridge.write_events
 
     def diagnosing_write_events(events):
+        matched_events = []
         try:
             active = bridge._active_context()
             for ev in events:
@@ -588,6 +614,7 @@ def _instrument_control_bridge(bridge) -> None:
                     )
                 else:
                     reason = None
+                    matched_events.append(ev)
                 if reason:
                     print(
                         f"[agent-control] control '{name}' not attached: {reason} "
@@ -601,6 +628,9 @@ def _instrument_control_bridge(bridge) -> None:
             f"accepted={getattr(result, 'accepted', '?')} "
             f"dropped={getattr(result, 'dropped', '?')}"
         )
+        if getattr(result, "dropped", 0) and matched_events:
+            # Only events that matched this run, so we never attach another tab's control.
+            _explain_control_span_failure(bridge, matched_events)
         return result
 
     bridge.write_events = diagnosing_write_events
