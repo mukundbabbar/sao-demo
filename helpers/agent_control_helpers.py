@@ -562,24 +562,48 @@ def bind_conversation(
 
 
 def _instrument_control_bridge(bridge) -> None:
-    """Log how many Agent Control events become control spans (accepted) or are dropped."""
+    """Explain why Agent Control events do not become control spans.
+
+    The SDK bridge only converts an event when its trace_id/span_id equal the
+    logger's active Run Agent context in the calling thread; otherwise it drops
+    the event silently. Log the reason so a missing control span is diagnosable.
+    """
     if bridge is None or getattr(bridge, "_demo_counting", False):
         return
     original = bridge.write_events
 
-    def counting_write_events(events):
-        result = original(events)
+    def diagnosing_write_events(events):
         try:
-            print(
-                f"[agent-control] events={len(events)} "
-                f"accepted={getattr(result, 'accepted', '?')} "
-                f"dropped={getattr(result, 'dropped', '?')}"
-            )
-        except Exception:
-            pass
+            active = bridge._active_context()
+            for ev in events:
+                ev_trace = getattr(ev, "trace_id", None)
+                ev_span = getattr(ev, "span_id", None)
+                name = getattr(ev, "control_name", None)
+                if active is None:
+                    reason = "no active Run Agent context in this thread/task"
+                elif not bridge._matches_active_context(ev, active):
+                    reason = (
+                        f"ids differ: event trace={ev_trace} span={ev_span} "
+                        f"vs active trace={active.trace_id} span={active.span_id}"
+                    )
+                else:
+                    reason = None
+                if reason:
+                    print(
+                        f"[agent-control] control '{name}' not attached: {reason} "
+                        f"(thread={threading.current_thread().name})"
+                    )
+        except Exception as exc:
+            print(f"[agent-control] diagnostics failed: {exc}")
+        result = original(events)
+        print(
+            f"[agent-control] events={len(events)} "
+            f"accepted={getattr(result, 'accepted', '?')} "
+            f"dropped={getattr(result, 'dropped', '?')}"
+        )
         return result
 
-    bridge.write_events = counting_write_events
+    bridge.write_events = diagnosing_write_events
     bridge._demo_counting = True
 
 
