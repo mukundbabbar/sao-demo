@@ -18,6 +18,7 @@ https://help.splunk.com/en/splunk-observability-cloud/observability-for-ai/splun
 """
 from __future__ import annotations
 
+import hashlib
 import uuid
 
 from opentelemetry import context as otel_context
@@ -44,8 +45,16 @@ def restore_otel_context(token) -> None:
 
 
 def conversation_id_for(tab_id: str) -> str:
-    """Stable gen_ai.conversation.id for one browser tab / Streamlit session."""
-    return str(uuid.uuid5(uuid.NAMESPACE_URL, f"sao-demo/{tab_id}"))
+    """Stable gen_ai.conversation.id for one browser tab / Streamlit session.
+
+    Must be a version-4 UUID: the SDK's LoggedControlSpan (and other span
+    models) reject any other UUID version for session_id, which silently
+    dropped every control span. Derive it deterministically from the tab id
+    (SHA-256, used only as a stable mapping, not for security) and stamp the
+    version/variant bits so it is a valid v4 UUID.
+    """
+    digest = hashlib.sha256(f"sao-demo/{tab_id}".encode("utf-8")).digest()
+    return str(uuid.UUID(bytes=digest[:16], version=4))
 
 
 def _with_attributes(span: ReadableSpan, extra: dict) -> ReadableSpan:
